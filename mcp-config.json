@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "ask-matrix-user": {
+      "command": "node",
+      "args": ["./ask-matrix-user.js"],
+      "env": {
+        "BRIDGE_API_URL": "http://127.0.0.1:9802"
+      }
+    },
+    "puppeteer": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
+      "env": {
+        "PUPPETEER_LAUNCH_OPTIONS": "{\"headless\": false, \"args\": [\"--no-sandbox\", \"--disable-setuid-sandbox\"]}"
+      }
+    },
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
+    }
+  }
+}
