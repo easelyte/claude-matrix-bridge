@@ -1524,13 +1524,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         const shortId = s.sessionId.slice(0, 8);
         const active = s.sessionId === activeId ? ' ⚡' : '';
         const desc = s.summary
-          ? `<br/><span style="color:gray">${s.summary.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>`
+          ? `<br/><span style="color:gray">${escapeHtml(s.summary)}</span>`
           : '';
         return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
       }).join('\n');
 
       const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse !resume <number> or !resume <id> to resume.`;
-      const html = `<b>Sessions for ${workdir}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>!resume &lt;number&gt;</code> or <code>!resume &lt;id&gt;</code> to resume.</i>`;
+      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>!resume &lt;number&gt;</code> or <code>!resume &lt;id&gt;</code> to resume.</i>`;
 
       await sendHtml(plainText, html);
       break;
