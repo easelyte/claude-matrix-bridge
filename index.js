@@ -892,6 +892,31 @@ async function updateRoomName(roomId, name) {
   }
 }
 
+function getSessionSummary(sessionId, workdir) {
+  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      const record = JSON.parse(line);
+      if (record.type === 'user' && record.message) {
+        const msg = record.message;
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.find(b => b.type === 'text')?.text || ''
+            : '';
+        if (text && !text.startsWith('<local-command') && !text.startsWith('<command-name>')) {
+          const clean = text.replace(/<[^>]+>/g, '').trim();
+          return clean.slice(0, 80) + (clean.length > 80 ? '…' : '');
+        }
+      }
+    }
+  } catch {}
+  return '';
+}
+
 // --- Media Handling ---
 
 async function downloadMatrixFile(mxcUrl) {
@@ -1099,7 +1124,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const shortId = resumeSessionId.slice(0, 8);
-      await updateRoomName(sessionRoomId, `${SERVER_LABEL}: Resumed ${shortId}`);
+      const summary = getSessionSummary(resumeSessionId, resumeWorkdir);
+      const roomName = summary
+        ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
+        : `${SERVER_LABEL}: Resumed ${shortId}`;
+      await updateRoomName(sessionRoomId, roomName);
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -1224,29 +1253,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           const sessionId = f.replace('.jsonl', '');
           const filePath = path.join(projectDir, f);
           const stat = fs.statSync(filePath);
-
-          let summary = '';
-          try {
-            const content = fs.readFileSync(filePath, 'utf-8');
-            for (const line of content.split('\n')) {
-              if (!line.trim()) continue;
-              const record = JSON.parse(line);
-              if (record.type === 'user' && record.message) {
-                const msg = record.message;
-                const text = typeof msg.content === 'string'
-                  ? msg.content
-                  : Array.isArray(msg.content)
-                    ? msg.content.find(b => b.type === 'text')?.text || ''
-                    : '';
-                if (text && !text.startsWith('<local-command') && !text.startsWith('<command-name>')) {
-                  summary = text.replace(/<[^>]+>/g, '').trim().slice(0, 80);
-                  if (text.trim().length > 80) summary += '…';
-                  break;
-                }
-              }
-            }
-          } catch {}
-
+          const summary = getSessionSummary(sessionId, workdir);
           return { sessionId, modified: stat.mtimeMs, summary };
         })
         .sort((a, b) => b.modified - a.modified);
