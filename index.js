@@ -875,9 +875,14 @@ function notice(type, plainText, htmlContent) {
 function markdownToHtml(text) {
   let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
 
+  // Convert list markers to placeholders BEFORE backtick split so inline code in list items works
+  processed = processed.replace(/^([-*])\s+/gm, '‹li›');
+  processed = processed.replace(/^(\d+)\.\s+/gm, '‹li›');
+
   const parts = processed.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
 
-  return parts.map((part, i) => {
+  // Phase 1: Process each part (inline formatting for text, code wrapping for code)
+  let html = parts.map((part, i) => {
     if (i % 2 === 1) {
       if (part.startsWith('```')) {
         const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
@@ -914,34 +919,34 @@ function markdownToHtml(text) {
       return `<blockquote>${inner}</blockquote>`;
     });
 
-    // Unordered lists: lines starting with - or *
-    html = html.replace(/^(?:[-*])\s+(.+)$/gm, '<li>$1</li>');
-
-    // Ordered lists: lines starting with 1. 2. etc
-    html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
-
-    // Tables: consecutive lines starting with | — render as <pre><code> for cross-client compatibility
-    html = html.replace(/(?:^|\n)((?:\|[^\n]+\|\n?)+)/g, (match, tableBlock) => {
-      return '<pre><code>' + padTable(tableBlock).replace(/\n/g, '&#10;') + '</code></pre>';
-    });
-
-    // Wrap consecutive <li> in <ul>
-    html = html.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, (match) => {
-      return `<ul>${match}</ul>`;
-    });
-
-    html = html.replace(/‹b›‹code›/g, '<b><code>');
-    html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
-
-    // Convert newlines to <br/> (but not before/after block elements)
-    html = html.replace(/\n/g, '<br/>');
-
-    // Clean up excessive <br/> around block elements
-    html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
-    html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)<br\/>/g, '$1');
-
     return html;
   }).join('');
+
+  // Phase 2: Block-level processing on joined HTML (so inline code within lists/tables works)
+  html = html.replace(/‹b›‹code›/g, '<b><code>');
+  html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
+
+  // List items (markers were converted to ‹li› before backtick split)
+  html = html.replace(/^‹li›(.+)$/gm, '<li>$1</li>');
+
+  // Tables: consecutive lines starting with | — render as <pre><code> for cross-client compatibility
+  html = html.replace(/(?:^|\n)((?:\|[^\n]+\|\n?)+)/g, (match, tableBlock) => {
+    return '<pre><code>' + padTable(tableBlock).replace(/\n/g, '&#10;') + '</code></pre>';
+  });
+
+  // Wrap consecutive <li> in <ul>
+  html = html.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, (match) => {
+    return `<ul>${match}</ul>`;
+  });
+
+  // Convert newlines to <br/> (but not before/after block elements)
+  html = html.replace(/\n/g, '<br/>');
+
+  // Clean up excessive <br/> around block elements
+  html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
+  html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)<br\/>/g, '$1');
+
+  return html;
 }
 
 // Pad pipe table columns to equal widths
