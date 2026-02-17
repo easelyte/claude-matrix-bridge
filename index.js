@@ -205,6 +205,9 @@ function createSession(roomId, workdir, resumeSessionId) {
         const restarted = createSession(roomId, cwd, session.claudeSessionId);
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
+        restarted.sendHtml = session.sendHtml;
+        restarted.originRoomId = session.originRoomId;
+        restarted.firstMessageCaptured = session.firstMessageCaptured;
         sessions.set(roomId, restarted);
         if (restarted.sendHtml) {
           const n = notice('warning',
@@ -1233,6 +1236,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const restarted = createSession(roomId, restartWorkdir, restartSessionId);
       restarted.sendCallback = sendReply;
       restarted.sendHtml = sendHtml;
+      restarted.originRoomId = existing.originRoomId;
+      restarted.firstMessageCaptured = existing.firstMessageCaptured;
       await sendReply(
         `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}`
       );
