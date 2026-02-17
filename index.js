@@ -54,10 +54,10 @@ function generateFileLink(filePath) {
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
 
-function generateActionLink(action, roomId) {
+function generateActionLink(action, roomId, extras) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ action, roomId, exp })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ action, roomId, exp, ...extras })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/action?token=${payload}.${sig}`;
 }
@@ -607,25 +607,6 @@ function handleClaudeEvent(session, event) {
           session.responseBuffer = text;
         }
         flushResponse(session);
-
-        // Send action links after the result
-        if (session.sendHtml) {
-          const stopLink = generateActionLink('stop', session.roomId);
-          const interruptLink = generateActionLink('interrupt', session.roomId);
-          if (stopLink || interruptLink) {
-            const links = [];
-            const plainLinks = [];
-            if (interruptLink) {
-              links.push(`<a href="${interruptLink}">⚡ Interrupt</a>`);
-              plainLinks.push('⚡ Interrupt');
-            }
-            if (stopLink) {
-              links.push(`<a href="${stopLink}">🛑 Stop Session</a>`);
-              plainLinks.push('🛑 Stop Session');
-            }
-            session.sendHtml(plainLinks.join(' · '), links.join(' · '));
-          }
-        }
       } else {
         session.responseBuffer = '';
       }
@@ -938,33 +919,9 @@ function markdownToHtml(text) {
     // Ordered lists: lines starting with 1. 2. etc
     html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
 
-    // Tables: consecutive lines starting with |
+    // Tables: consecutive lines starting with | — render as <pre><code> for cross-client compatibility
     html = html.replace(/(?:^|\n)((?:\|[^\n]+\|\n?)+)/g, (match, tableBlock) => {
-      const rows = tableBlock.trim().split('\n').filter(r => r.trim());
-      // Filter out separator rows (|---|---|)
-      const dataRows = rows.filter(r => !/^\|[\s\-:|]+\|$/.test(r));
-      if (dataRows.length === 0) return match;
-
-      const parseRow = (row) => row.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
-      const headerCells = parseRow(dataRows[0]);
-      // It's a table with headers if the second original row is a separator
-      const hasSeparator = rows.length > 1 && /^\|[\s\-:|]+\|$/.test(rows[1]);
-
-      let tableHtml = '<table>';
-      if (hasSeparator) {
-        tableHtml += '<thead><tr>' + headerCells.map(c => `<th>${c}</th>`).join('') + '</tr></thead>';
-        tableHtml += '<tbody>' + dataRows.slice(1).map(r => {
-          const cells = parseRow(r);
-          return '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
-        }).join('') + '</tbody>';
-      } else {
-        tableHtml += '<tbody>' + dataRows.map(r => {
-          const cells = parseRow(r);
-          return '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
-        }).join('') + '</tbody>';
-      }
-      tableHtml += '</table>';
-      return tableHtml;
+      return '<pre><code>' + padTable(tableBlock).replace(/\n/g, '&#10;') + '</code></pre>';
     });
 
     // Wrap consecutive <li> in <ul>
@@ -986,11 +943,33 @@ function markdownToHtml(text) {
   }).join('');
 }
 
+// Pad pipe table columns to equal widths
+function padTable(tableText) {
+  const rows = tableText.trim().split('\n');
+  const parsed = rows.map(r => r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim()));
+  const colCount = Math.max(...parsed.map(r => r.length));
+  const widths = Array(colCount).fill(0);
+  for (const row of parsed) {
+    // Skip separator rows for width calculation
+    if (/^[\s\-:]+$/.test(row.join(''))) continue;
+    for (let i = 0; i < row.length; i++) {
+      widths[i] = Math.max(widths[i], (row[i] || '').length);
+    }
+  }
+  return rows.map(r => {
+    const cells = r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+    if (/^[\s\-:]+$/.test(cells.join(''))) {
+      return '| ' + widths.map(w => '-'.repeat(w)).join(' | ') + ' |';
+    }
+    return '| ' + cells.map((c, i) => (c || '').padEnd(widths[i] || 0)).join(' | ') + ' |';
+  }).join('\n');
+}
+
 // Improve plain text body for clients that don't render HTML (e.g. Element X)
-// Wraps pipe tables in code fences so they render monospaced
+// Wraps pipe tables in code fences so they render monospaced with aligned columns
 function plainTextFormat(text) {
   return text.replace(/((?:^\|.+\|\n?)+)/gm, (match) => {
-    return '```\n' + match.trimEnd() + '\n```';
+    return '```\n' + padTable(match) + '\n```';
   });
 }
 
@@ -1040,9 +1019,11 @@ async function sendToRoom(roomId, text, html) {
     content.formatted_body = html;
   }
   try {
-    await client.sendMessage(roomId, content);
+    const res = await client.sendMessage(roomId, content);
+    return res?.event_id || null;
   } catch (e) {
     console.error('Failed to send message:', e.message);
+    return null;
   }
 }
 
@@ -1837,10 +1818,15 @@ client.on('room.message', async (roomId, event) => {
     const preview = hasMedia
       ? (event.content.body || '[media]')
       : (text.length > 40 ? text.slice(0, 37) + '…' : text);
+    const queueIndex = count - 1;
     const interruptLink = generateActionLink('interrupt', roomId);
+    const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
     const plainQueue = `📨 Queued (${count}): ${preview}\nSend "interrupt" to force send now.`;
-    if (interruptLink) {
-      const htmlQueue = `📨 Queued (${count}): ${escapeHtml(preview)}<br/><a href="${interruptLink}">⚡ Interrupt</a>`;
+    if (interruptLink || cancelLink) {
+      const links = [];
+      if (cancelLink) links.push(`<a href="${cancelLink}">✕ Cancel</a>`);
+      if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Interrupt</a>`);
+      const htmlQueue = `📨 Queued (${count}): ${escapeHtml(preview)}<br/>${links.join(' · ')}`;
       await sendHtmlFn(plainQueue, htmlQueue);
     } else {
       await sendReply(plainQueue);
@@ -1993,6 +1979,37 @@ const apiServer = createServer((req, res) => {
         sendTextToSession(session, message);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
+
+      } else if (url.pathname === '/cancel-queued') {
+        const { roomId, index } = data;
+        if (!roomId || typeof index !== 'number') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and index required' }));
+          return;
+        }
+        const session = sessions.get(roomId);
+        if (!session || !session.alive) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No active session for this room' }));
+          return;
+        }
+        const queue = session.queuedMessages;
+        if (!queue || index < 0 || index >= queue.length) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No queued message at that index' }));
+          return;
+        }
+        queue.splice(index, 1);
+        const remaining = queue.length;
+        if (remaining === 0) session.queuedMessages = null;
+        if (session.sendCallback) {
+          const msg = remaining === 0
+            ? '✕ Cancelled queued message (queue empty)'
+            : `✕ Cancelled queued message (${remaining} remaining)`;
+          session.sendCallback(msg);
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, remaining }));
 
       } else if (url.pathname === '/message') {
         const { roomId, text } = data;
