@@ -1852,7 +1852,7 @@ client.on('room.message', async (roomId, event) => {
   // Queue/interrupt logic when Claude is busy
   if (session.busy) {
     const lowerText = text.toLowerCase().trim();
-    if (lowerText === 'interrupt' || lowerText === '!interrupt') {
+    if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
       stripQueueNotificationLinks(session);
@@ -1861,6 +1861,25 @@ client.on('room.message', async (roomId, event) => {
         flushQueue(session, queued);
       } else {
         await sendReply('⚡ No queued messages to send.');
+      }
+      return;
+    }
+    if (lowerText === 'cancel') {
+      const queue = session.queuedMessages || [];
+      const notifs = session.queueNotifications || [];
+      if (queue.length === 0) {
+        await sendReply('No queued messages to cancel.');
+        return;
+      }
+      queue.pop();
+      if (notifs.length > 0) {
+        const { eventId, plain } = notifs.pop();
+        if (eventId) {
+          await editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
+        }
+      }
+      if (queue.length === 0) {
+        session.queuedMessages = null;
       }
       return;
     }
