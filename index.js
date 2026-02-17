@@ -1957,11 +1957,31 @@ client.on('room.message', async (roomId, event) => {
 
   if (hasMedia) {
     try {
+      // Show transcription status for voice notes
+      let statusEventId = null;
+      if (msgtype === 'm.audio') {
+        const transcribeNotice = notice('info', 'Transcribing voice note...', 'Transcribing voice note…');
+        statusEventId = await sendHtmlFn(transcribeNotice.plain, transcribeNotice.html);
+      }
+
       const blocks = await buildMediaContentBlocks(event, session);
       if (blocks.length === 0) {
-        await sendReply('Could not process the file.');
+        if (statusEventId) await editMessage(roomId, statusEventId, 'Voice note transcription failed', notice('error', 'Voice note transcription failed', 'Voice note transcription failed').html);
+        else await sendReply('Could not process the file.');
         return;
       }
+
+      // Update status with transcription preview
+      if (statusEventId && msgtype === 'm.audio') {
+        const transcriptionBlock = blocks.find(b => b.type === 'text' && b.text.startsWith('[Voice note transcription]'));
+        if (transcriptionBlock) {
+          const preview = transcriptionBlock.text.replace('[Voice note transcription]: ', '');
+          const truncated = preview.length > 100 ? preview.slice(0, 97) + '…' : preview;
+          const doneNotice = notice('success', `Transcribed: ${truncated}`, `Transcribed: ${escapeHtml(truncated)}`);
+          await editMessage(roomId, statusEventId, doneNotice.plain, doneNotice.html);
+        }
+      }
+
       if (!sendToSession(session, blocks)) {
         await sendReply('Session is not available. Send !start to begin a new one.');
       } else if (!session.firstMessageCaptured) {
