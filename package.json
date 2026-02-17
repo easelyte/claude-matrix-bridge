@@ -8,13 +8,15 @@
   },
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "bootstrap-crosssigning": "node bootstrap-crosssigning.mjs"
   },
   "dependencies": {
     "matrix-bot-sdk": "^0.7.0",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "zod": "^4.3.6"
+    "zod": "^4.3.6",
+    "matrix-js-sdk": "^34.0.0"
   }
 }
