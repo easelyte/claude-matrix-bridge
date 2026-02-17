@@ -815,6 +815,35 @@ function markdownToHtml(text) {
     // Ordered lists: lines starting with 1. 2. etc
     html = html.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
 
+    // Tables: consecutive lines starting with |
+    html = html.replace(/(?:^|\n)((?:\|[^\n]+\|\n?)+)/g, (match, tableBlock) => {
+      const rows = tableBlock.trim().split('\n').filter(r => r.trim());
+      // Filter out separator rows (|---|---|)
+      const dataRows = rows.filter(r => !/^\|[\s\-:|]+\|$/.test(r));
+      if (dataRows.length === 0) return match;
+
+      const parseRow = (row) => row.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+      const headerCells = parseRow(dataRows[0]);
+      // It's a table with headers if the second original row is a separator
+      const hasSeparator = rows.length > 1 && /^\|[\s\-:|]+\|$/.test(rows[1]);
+
+      let tableHtml = '<table>';
+      if (hasSeparator) {
+        tableHtml += '<thead><tr>' + headerCells.map(c => `<th>${c}</th>`).join('') + '</tr></thead>';
+        tableHtml += '<tbody>' + dataRows.slice(1).map(r => {
+          const cells = parseRow(r);
+          return '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
+        }).join('') + '</tbody>';
+      } else {
+        tableHtml += '<tbody>' + dataRows.map(r => {
+          const cells = parseRow(r);
+          return '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
+        }).join('') + '</tbody>';
+      }
+      tableHtml += '</table>';
+      return tableHtml;
+    });
+
     html = html.replace(/‹b›‹code›/g, '<b><code>');
     html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
 
@@ -822,8 +851,8 @@ function markdownToHtml(text) {
     html = html.replace(/\n/g, '<br/>');
 
     // Clean up excessive <br/> around block elements
-    html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul)(?:\s[^>]*)?>)/g, '$1');
-    html = html.replace(/(<\/?(?:hr|li|pre|ol|ul)(?:\s[^>]*)?>)<br\/>/g, '$1');
+    html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td)(?:\s[^>]*)?>)/g, '$1');
+    html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td)(?:\s[^>]*)?>)<br\/>/g, '$1');
 
     return html;
   }).join('');
