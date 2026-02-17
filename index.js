@@ -611,6 +611,7 @@ function handleClaudeEvent(session, event) {
         session.responseBuffer = '';
       }
       session.busy = false;
+      stripQueueNotificationLinks(session);
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
         session.typingInterval = null;
@@ -1019,8 +1020,8 @@ async function sendToRoom(roomId, text, html) {
     content.formatted_body = html;
   }
   try {
-    const res = await client.sendMessage(roomId, content);
-    return res?.event_id || null;
+    const eventId = await client.sendMessage(roomId, content);
+    return eventId || null;
   } catch (e) {
     console.error('Failed to send message:', e.message);
     return null;
@@ -1044,6 +1045,36 @@ async function createSessionRoom(inviteUserId) {
   });
   debug(`Created session room ${roomId} for ${inviteUserId}`);
   return roomId;
+}
+
+async function editMessage(roomId, eventId, plain, html) {
+  const content = {
+    msgtype: 'm.text',
+    body: `* ${plain}`,
+    'm.new_content': {
+      msgtype: 'm.text',
+      body: plain,
+      ...(html ? { format: 'org.matrix.custom.html', formatted_body: html } : {}),
+    },
+    'm.relates_to': {
+      rel_type: 'm.replace',
+      event_id: eventId,
+    },
+  };
+  try {
+    await client.sendEvent(roomId, 'm.room.message', content);
+  } catch (e) {
+    debug('Failed to edit message:', e.message);
+  }
+}
+
+async function stripQueueNotificationLinks(session) {
+  const notifs = session.queueNotifications || [];
+  if (notifs.length === 0) return;
+  session.queueNotifications = [];
+  for (const { eventId, plain } of notifs) {
+    await editMessage(session.roomId, eventId, plain);
+  }
 }
 
 async function updateRoomName(roomId, name) {
@@ -1081,19 +1112,39 @@ function getSessionSummary(sessionId, workdir) {
 
 // --- Media Handling ---
 
-async function downloadMatrixFile(mxcUrl) {
-  const content = await client.downloadContent(mxcUrl);
-  return Buffer.from(content.data);
+async function downloadMatrixFile(mxcUrl, fileInfo) {
+  // Use authenticated media endpoint (unauthenticated downloads are disabled on this homeserver)
+  const urlParts = mxcUrl.replace('mxc://', '').split('/');
+  const domain = encodeURIComponent(urlParts[0]);
+  const mediaId = encodeURIComponent(urlParts[1]);
+  const downloadUrl = `${MATRIX_HOMESERVER_URL}/_matrix/client/v1/media/download/${domain}/${mediaId}`;
+  const res = await fetch(downloadUrl, {
+    headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
+  });
+  if (!res.ok) throw new Error(`Media download failed: ${res.status} ${res.statusText}`);
+  let buffer = Buffer.from(await res.arrayBuffer());
+
+  // Decrypt if encrypted (E2E attachment)
+  if (fileInfo?.key && fileInfo?.iv) {
+    const { createDecipheriv } = await import('crypto');
+    // Matrix uses AES-256-CTR with a JWK key
+    const keyData = Buffer.from(fileInfo.key.k.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    const iv = Buffer.from(fileInfo.iv, 'base64');
+    const decipher = createDecipheriv('aes-256-ctr', keyData, iv);
+    buffer = Buffer.concat([decipher.update(buffer), decipher.final()]);
+  }
+
+  return buffer;
 }
 
 async function buildMediaContentBlocks(event, session) {
   const blocks = [];
   const content = event.content;
-  const mxcUrl = content.url;
+  const mxcUrl = content.url || content.file?.url;
 
   if (!mxcUrl) return blocks;
 
-  const buffer = await downloadMatrixFile(mxcUrl);
+  const buffer = await downloadMatrixFile(mxcUrl, content.file);
   const fileName = content.body || 'file';
   const mime = content.info?.mimetype || 'application/octet-stream';
 
@@ -1793,14 +1844,18 @@ client.on('room.message', async (roomId, event) => {
     if (lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
-      await sendReply(`⚡ Interrupting Claude...${queued.length > 0 ? ` (sending ${queued.length} queued message${queued.length > 1 ? 's' : ''})` : ''}`);
+      stripQueueNotificationLinks(session);
       if (queued.length > 0) {
+        await sendReply(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
         flushQueue(session, queued);
+      } else {
+        await sendReply('⚡ No queued messages to send.');
       }
       return;
     }
     // Queue the message
     if (!session.queuedMessages) session.queuedMessages = [];
+    if (!session.queueNotifications) session.queueNotifications = [];
 
     if (hasMedia) {
       try {
@@ -1821,15 +1876,16 @@ client.on('room.message', async (roomId, event) => {
     const queueIndex = count - 1;
     const interruptLink = generateActionLink('interrupt', roomId);
     const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
-    const plainQueue = `📨 Queued (${count}): ${preview}\nSend "interrupt" to force send now.`;
+    const plainNotif = `📨 Queued (${count}): ${preview}`;
     if (interruptLink || cancelLink) {
       const links = [];
       if (cancelLink) links.push(`<a href="${cancelLink}">✕ Cancel</a>`);
-      if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Interrupt</a>`);
-      const htmlQueue = `📨 Queued (${count}): ${escapeHtml(preview)}<br/>${links.join(' · ')}`;
-      await sendHtmlFn(plainQueue, htmlQueue);
+      if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Send now</a>`);
+      const htmlQueue = `${escapeHtml(plainNotif)}<br/>${links.join(' · ')}`;
+      const notifEventId = await sendHtmlFn(plainNotif, htmlQueue);
+      if (notifEventId) session.queueNotifications.push({ eventId: notifEventId, plain: plainNotif });
     } else {
-      await sendReply(plainQueue);
+      await sendReply(plainNotif);
     }
     return;
   }
@@ -1980,6 +2036,32 @@ const apiServer = createServer((req, res) => {
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
 
+      } else if (url.pathname === '/interrupt') {
+        const { roomId } = data;
+        if (!roomId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId required' }));
+          return;
+        }
+        const session = sessions.get(roomId);
+        if (!session || !session.alive) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No active session for this room' }));
+          return;
+        }
+        const queued = session.queuedMessages || [];
+        session.queuedMessages = null;
+        stripQueueNotificationLinks(session);
+        if (queued.length > 0) {
+          if (session.sendCallback) {
+            session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
+          }
+          flushQueue(session, queued);
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, flushed: queued.length }));
+
+
       } else if (url.pathname === '/cancel-queued') {
         const { roomId, index } = data;
         if (!roomId || typeof index !== 'number') {
@@ -2000,6 +2082,14 @@ const apiServer = createServer((req, res) => {
           return;
         }
         queue.splice(index, 1);
+        // Edit the notification for this index to remove links
+        const notifs = session.queueNotifications || [];
+        if (index < notifs.length) {
+          const { eventId, plain } = notifs.splice(index, 1)[0];
+          if (eventId) {
+            editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
+          }
+        }
         const remaining = queue.length;
         if (remaining === 0) session.queuedMessages = null;
         if (session.sendCallback) {

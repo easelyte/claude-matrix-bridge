@@ -112,9 +112,9 @@ app.get('/action', async (req, res) => {
   try {
     let endpoint, body, label;
     if (action === 'interrupt') {
-      endpoint = '/send';
-      body = { roomId, message: 'interrupt' };
-      label = '⚡ Interrupted';
+      endpoint = '/interrupt';
+      body = { roomId };
+      label = '⚡ Sending queued messages';
     } else if (action === 'cancel') {
       endpoint = '/cancel-queued';
       body = { roomId, index };
