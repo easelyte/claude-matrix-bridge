@@ -806,6 +806,9 @@ function markdownToHtml(text) {
     html = html.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
     html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
 
+    // Linkify URLs (not already inside tags)
+    html = html.replace(/(https?:\/\/[^\s<>"']+)/g, '<a href="$1">$1</a>');
+
     // Horizontal rules
     html = html.replace(/^-{3,}$/gm, '<hr/>');
 
@@ -1757,7 +1760,7 @@ const apiServer = createServer((req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, text).then(() => {
+        sendToRoom(roomId, text, markdownToHtml(text)).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
