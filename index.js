@@ -29,6 +29,14 @@ const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+
+// Server label for room names: "dev-2" → "D2", fallback to SERVER_LABEL env var
+const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
+  const hostname = os.hostname();
+  const match = hostname.match(/^(\w+)-(\d+)/);
+  if (match) return match[1].charAt(0).toUpperCase() + match[2];
+  return hostname.slice(0, 4).toUpperCase();
+})();
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
@@ -44,6 +52,14 @@ function generateFileLink(filePath) {
   const payload = Buffer.from(JSON.stringify({ path: filePath, exp })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
+}
+
+function generateActionLink(action, roomId, extras) {
+  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
+  const payload = Buffer.from(JSON.stringify({ action, roomId, exp, ...extras })).toString('base64url');
+  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
+  return `${VIEWER_BASE_URL}/action?token=${payload}.${sig}`;
 }
 
 function isPlanFile(filePath) {
@@ -76,9 +92,9 @@ function savePersistedSessions(data) {
   }
 }
 
-function persistSession(roomId, sessionId, workdir) {
+function persistSession(roomId, sessionId, workdir, originRoomId) {
   const data = loadPersistedSessions();
-  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now() };
+  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null };
   savePersistedSessions(data);
 }
 
@@ -138,6 +154,9 @@ function createSession(roomId, workdir, resumeSessionId) {
     lineBuf: '',
     toolCalls: [], // collected tool indicators for this turn
     waitingForAnswer: null,
+    // Per-session room tracking
+    originRoomId: null,
+    firstMessageCaptured: false,
     // Captured from system init event
     initData: null,
     // Accumulated usage stats
@@ -186,15 +205,26 @@ function createSession(roomId, workdir, resumeSessionId) {
         const restarted = createSession(roomId, cwd, session.claudeSessionId);
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
+        restarted.sendHtml = session.sendHtml;
+        restarted.originRoomId = session.originRoomId;
+        restarted.firstMessageCaptured = session.firstMessageCaptured;
         sessions.set(roomId, restarted);
-        if (restarted.sendCallback) {
+        if (restarted.sendHtml) {
+          const n = notice('warning',
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+          restarted.sendHtml(n.plain, n.html);
+        } else if (restarted.sendCallback) {
           restarted.sendCallback(
             `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
           );
         }
       } else {
         sessions.delete(roomId);
-        if (session.sendCallback) {
+        if (session.sendHtml) {
+          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
       }
@@ -386,7 +416,7 @@ function handleClaudeEvent(session, event) {
   // Capture session ID from any event that carries it
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
-    persistSession(session.roomId, session.claudeSessionId, session.workdir);
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId);
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
   }
 
@@ -448,6 +478,7 @@ function handleClaudeEvent(session, event) {
         } else {
           // Collect tool indicator
           let indicator = `🔧 ${toolName}`;
+          let indicatorHtml = null;
           let isKeyEvent = false;
 
           if (toolName === 'Bash' && input.command) {
@@ -455,37 +486,52 @@ function handleClaudeEvent(session, event) {
               ? input.command.slice(0, 100) + '…'
               : input.command;
             indicator = `🔧 \`${cmd}\``;
+            indicatorHtml = `🔧 <code>${escapeHtml(cmd)}</code>`;
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
+            indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
           } else if (toolName === 'Write' && input.file_path) {
             indicator = `✏️ Writing ${input.file_path}`;
+            indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
             isKeyEvent = true;
             if (isPlanFile(input.file_path)) {
               const absPath = path.isAbsolute(input.file_path)
                 ? input.file_path
                 : path.join(session.workdir, input.file_path);
               const link = generateFileLink(absPath);
-              if (link) indicator += `\n🔗 View in browser (expires ${LINK_EXPIRY_MS / 60000}min): ${link}`;
+              if (link) {
+                indicator += `\n[🔗 View in browser](${link})`;
+                indicatorHtml += `<br/><a href="${link}">🔗 View in browser</a>`;
+              }
             }
           } else if (toolName === 'Edit' && input.file_path) {
             indicator = `✏️ Editing ${input.file_path}`;
+            indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
             isKeyEvent = true;
             if (isPlanFile(input.file_path)) {
               const absPath = path.isAbsolute(input.file_path)
                 ? input.file_path
                 : path.join(session.workdir, input.file_path);
               const link = generateFileLink(absPath);
-              if (link) indicator += `\n🔗 View in browser (expires ${LINK_EXPIRY_MS / 60000}min): ${link}`;
+              if (link) {
+                indicator += `\n[🔗 View in browser](${link})`;
+                indicatorHtml += `<br/><a href="${link}">🔗 View in browser</a>`;
+              }
             }
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
+            indicatorHtml = `🔍 <code>${escapeHtml(input.pattern)}</code>`;
           } else if (toolName === 'WebSearch' && input.query) {
             indicator = `🌐 ${input.query}`;
+            indicatorHtml = `🌐 <i>${escapeHtml(input.query)}</i>`;
             isKeyEvent = true;
           } else if (toolName === 'WebFetch' && input.url) {
             indicator = `🌐 ${input.url}`;
+            indicatorHtml = `🌐 <a href="${escapeHtml(input.url)}">${escapeHtml(input.url)}</a>`;
           } else if (toolName === 'Task') {
-            indicator = `🔀 Subtask: ${(input.description || input.prompt || '').slice(0, 80)}`;
+            const desc = (input.description || input.prompt || '').slice(0, 80);
+            indicator = `🔀 Subtask: ${desc}`;
+            indicatorHtml = `🔀 Subtask: <i>${escapeHtml(desc)}</i>`;
             isKeyEvent = true;
           } else if (toolName === 'TodoWrite') {
             const todos = (input.todos || []).map(t => {
@@ -493,12 +539,19 @@ function handleClaudeEvent(session, event) {
               return `${icon} ${t.content || t.text || ''}`;
             }).join('\n');
             indicator = `📋 Todos:\n${todos}`;
+            const todosHtml = (input.todos || []).map(t => {
+              const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
+              return `<li>${icon} ${escapeHtml(t.content || t.text || '')}</li>`;
+            }).join('');
+            indicatorHtml = `📋 <b>Todos:</b><ul>${todosHtml}</ul>`;
             isKeyEvent = true;
           }
 
           session.toolCalls.push(indicator);
 
-          if (isKeyEvent && session.sendCallback) {
+          if (isKeyEvent && session.sendHtml && indicatorHtml) {
+            session.sendHtml(indicator, indicatorHtml);
+          } else if (isKeyEvent && session.sendCallback) {
             session.sendCallback(indicator);
           }
         }
@@ -558,9 +611,11 @@ function handleClaudeEvent(session, event) {
         session.responseBuffer = '';
       }
       session.busy = false;
+      stripQueueNotificationLinks(session);
       if (session.typingInterval) {
         clearInterval(session.typingInterval);
         session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
       }
 
       // Check for ExitPlanMode permission denial — present Build prompt
@@ -575,9 +630,15 @@ function handleClaudeEvent(session, event) {
           ? planText.slice(0, 500) + '…'
           : planText;
 
-        session.sendCallback(
-          `--- Plan Ready ---\n\n${planPreview}\n\nReply "build" to execute, or send feedback.`
-        );
+        const plainPlan = `--- Plan Ready ---\n\n${planPreview}\n\nReply "build" to execute, or send feedback.`;
+        if (session.sendHtml) {
+          const htmlPlan =
+            `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(planPreview)}</blockquote>` +
+            `Reply <code>build</code> to execute, or send feedback.`;
+          session.sendHtml(plainPlan, htmlPlan);
+        } else {
+          session.sendCallback(plainPlan);
+        }
       }
 
       // Send any queued messages now that Claude is free
@@ -598,13 +659,20 @@ function handleClaudeEvent(session, event) {
         debug('Captured init data: model=%s, tools=%d, mcp=%d',
           event.model, event.tools?.length, event.mcp_servers?.length);
       } else if (event.subtype === 'compact' || event.subtype === 'context_compaction') {
-        if (session.sendCallback) {
+        if (session.sendHtml) {
+          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space.');
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
           session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
         }
       } else if (event.subtype === 'task_notification') {
-        const status = event.status === 'completed' ? '✅' : '❌';
-        if (session.sendCallback) {
-          session.sendCallback(`${status} Task: ${event.summary || 'unknown'}`);
+        const isComplete = event.status === 'completed';
+        const taskPlain = `${isComplete ? '✅' : '❌'} Task: ${event.summary || 'unknown'}`;
+        if (session.sendHtml) {
+          const n = notice(isComplete ? 'success' : 'error', taskPlain);
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
+          session.sendCallback(taskPlain);
         }
       }
       break;
@@ -613,7 +681,10 @@ function handleClaudeEvent(session, event) {
     case 'stream_event': {
       const evt = event.event;
       if (evt?.type === 'message_delta' && evt?.context_management?.applied_edits?.length > 0) {
-        if (session.sendCallback) {
+        if (session.sendHtml) {
+          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space.');
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
           session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space.');
         }
       }
@@ -771,15 +842,54 @@ function escapeHtml(text) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function color(text, hex) {
+  return `<font color="${hex}">${text}</font>`;
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return rs ? `${m}m ${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `${h}h ${rm}m` : `${h}h`;
+}
+
+const NOTICE_COLORS = {
+  success: '#3fb950',
+  error: '#f85149',
+  warning: '#f0883e',
+  info: '#58a6ff',
+};
+
+function notice(type, plainText, htmlContent) {
+  const hex = NOTICE_COLORS[type] || NOTICE_COLORS.info;
+  return {
+    plain: plainText,
+    html: `${color('▌', hex)} ${htmlContent || escapeHtml(plainText)}`,
+  };
+}
+
 function markdownToHtml(text) {
   let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
 
+  // Convert list markers to placeholders BEFORE backtick split so inline code in list items works
+  processed = processed.replace(/^([-*])\s+/gm, '‹li›');
+  processed = processed.replace(/^(\d+)\.\s+/gm, '‹li›');
+
   const parts = processed.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
 
-  return parts.map((part, i) => {
+  // Phase 1: Process each part (inline formatting for text, code wrapping for code)
+  let html = parts.map((part, i) => {
     if (i % 2 === 1) {
       if (part.startsWith('```')) {
         const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
+        const lineCount = inner.split('\n').length;
+        if (lineCount > 15) {
+          return `<details><summary>Code (${lineCount} lines)</summary><pre>${escapeHtml(inner)}</pre></details>`;
+        }
         return `<pre>${escapeHtml(inner)}</pre>`;
       }
       return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
@@ -794,11 +904,79 @@ function markdownToHtml(text) {
     html = html.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
     html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
 
-    html = html.replace(/‹b›‹code›/g, '<b><code>');
-    html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
+    // Markdown links: [text](url)
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+
+    // Linkify remaining bare URLs (not already inside tags)
+    html = html.replace(/(?<!href="|">)(https?:\/\/[^\s<>"']+)/g, '<a href="$1">$1</a>');
+
+    // Horizontal rules
+    html = html.replace(/^-{3,}$/gm, '<hr/>');
+
+    // Blockquotes: consecutive > lines
+    html = html.replace(/(^&gt;\s?.+(\n|$))+/gm, (match) => {
+      const inner = match.replace(/^&gt;\s?/gm, '').trim();
+      return `<blockquote>${inner}</blockquote>`;
+    });
 
     return html;
   }).join('');
+
+  // Phase 2: Block-level processing on joined HTML (so inline code within lists/tables works)
+  html = html.replace(/‹b›‹code›/g, '<b><code>');
+  html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
+
+  // List items (markers were converted to ‹li› before backtick split)
+  html = html.replace(/^‹li›(.+)$/gm, '<li>$1</li>');
+
+  // Tables: consecutive lines starting with | — render as <pre><code> for cross-client compatibility
+  html = html.replace(/(?:^|\n)((?:\|[^\n]+\|\n?)+)/g, (match, tableBlock) => {
+    return '<pre><code>' + padTable(tableBlock).replace(/\n/g, '&#10;') + '</code></pre>';
+  });
+
+  // Wrap consecutive <li> in <ul>
+  html = html.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, (match) => {
+    return `<ul>${match}</ul>`;
+  });
+
+  // Convert newlines to <br/> (but not before/after block elements)
+  html = html.replace(/\n/g, '<br/>');
+
+  // Clean up excessive <br/> around block elements
+  html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
+  html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)<br\/>/g, '$1');
+
+  return html;
+}
+
+// Pad pipe table columns to equal widths
+function padTable(tableText) {
+  const rows = tableText.trim().split('\n');
+  const parsed = rows.map(r => r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim()));
+  const colCount = Math.max(...parsed.map(r => r.length));
+  const widths = Array(colCount).fill(0);
+  for (const row of parsed) {
+    // Skip separator rows for width calculation
+    if (/^[\s\-:]+$/.test(row.join(''))) continue;
+    for (let i = 0; i < row.length; i++) {
+      widths[i] = Math.max(widths[i], (row[i] || '').length);
+    }
+  }
+  return rows.map(r => {
+    const cells = r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+    if (/^[\s\-:]+$/.test(cells.join(''))) {
+      return '| ' + widths.map(w => '-'.repeat(w)).join(' | ') + ' |';
+    }
+    return '| ' + cells.map((c, i) => (c || '').padEnd(widths[i] || 0)).join(' | ') + ' |';
+  }).join('\n');
+}
+
+// Improve plain text body for clients that don't render HTML (e.g. Element X)
+// Wraps pipe tables in code fences so they render monospaced with aligned columns
+function plainTextFormat(text) {
+  return text.replace(/((?:^\|.+\|\n?)+)/gm, (match) => {
+    return '```\n' + padTable(match) + '\n```';
+  });
 }
 
 // --- File Helpers ---
@@ -847,27 +1025,131 @@ async function sendToRoom(roomId, text, html) {
     content.formatted_body = html;
   }
   try {
-    await client.sendMessage(roomId, content);
+    const eventId = await client.sendMessage(roomId, content);
+    return eventId || null;
   } catch (e) {
     console.error('Failed to send message:', e.message);
+    return null;
   }
+}
+
+// --- Room Management ---
+
+async function createSessionRoom(inviteUserId) {
+  const roomId = await client.createRoom({
+    preset: 'private_chat',
+    name: `${SERVER_LABEL}: New session`,
+    invite: [inviteUserId],
+    initial_state: [
+      {
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      },
+    ],
+  });
+  debug(`Created session room ${roomId} for ${inviteUserId}`);
+  return roomId;
+}
+
+async function editMessage(roomId, eventId, plain, html) {
+  const content = {
+    msgtype: 'm.text',
+    body: `* ${plain}`,
+    'm.new_content': {
+      msgtype: 'm.text',
+      body: plain,
+      ...(html ? { format: 'org.matrix.custom.html', formatted_body: html } : {}),
+    },
+    'm.relates_to': {
+      rel_type: 'm.replace',
+      event_id: eventId,
+    },
+  };
+  try {
+    await client.sendEvent(roomId, 'm.room.message', content);
+  } catch (e) {
+    debug('Failed to edit message:', e.message);
+  }
+}
+
+async function stripQueueNotificationLinks(session) {
+  const notifs = session.queueNotifications || [];
+  if (notifs.length === 0) return;
+  session.queueNotifications = [];
+  for (const { eventId, plain } of notifs) {
+    await editMessage(session.roomId, eventId, plain);
+  }
+}
+
+async function updateRoomName(roomId, name) {
+  try {
+    await client.sendStateEvent(roomId, 'm.room.name', '', { name });
+  } catch (e) {
+    debug(`Failed to update room name: ${e.message}`);
+  }
+}
+
+function getSessionSummary(sessionId, workdir) {
+  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      const record = JSON.parse(line);
+      if (record.type === 'user' && record.message) {
+        const msg = record.message;
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.find(b => b.type === 'text')?.text || ''
+            : '';
+        if (text && !text.startsWith('<local-command') && !text.startsWith('<command-name>')) {
+          const clean = text.replace(/<[^>]+>/g, '').trim();
+          return clean.slice(0, 80) + (clean.length > 80 ? '…' : '');
+        }
+      }
+    }
+  } catch {}
+  return '';
 }
 
 // --- Media Handling ---
 
-async function downloadMatrixFile(mxcUrl) {
-  const content = await client.downloadContent(mxcUrl);
-  return Buffer.from(content.data);
+async function downloadMatrixFile(mxcUrl, fileInfo) {
+  // Use authenticated media endpoint (unauthenticated downloads are disabled on this homeserver)
+  const urlParts = mxcUrl.replace('mxc://', '').split('/');
+  const domain = encodeURIComponent(urlParts[0]);
+  const mediaId = encodeURIComponent(urlParts[1]);
+  const downloadUrl = `${MATRIX_HOMESERVER_URL}/_matrix/client/v1/media/download/${domain}/${mediaId}`;
+  const res = await fetch(downloadUrl, {
+    headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
+  });
+  if (!res.ok) throw new Error(`Media download failed: ${res.status} ${res.statusText}`);
+  let buffer = Buffer.from(await res.arrayBuffer());
+
+  // Decrypt if encrypted (E2E attachment)
+  if (fileInfo?.key && fileInfo?.iv) {
+    const { createDecipheriv } = await import('crypto');
+    // Matrix uses AES-256-CTR with a JWK key
+    const keyData = Buffer.from(fileInfo.key.k.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    const iv = Buffer.from(fileInfo.iv, 'base64');
+    const decipher = createDecipheriv('aes-256-ctr', keyData, iv);
+    buffer = Buffer.concat([decipher.update(buffer), decipher.final()]);
+  }
+
+  return buffer;
 }
 
 async function buildMediaContentBlocks(event, session) {
   const blocks = [];
   const content = event.content;
-  const mxcUrl = content.url;
+  const mxcUrl = content.url || content.file?.url;
 
   if (!mxcUrl) return blocks;
 
-  const buffer = await downloadMatrixFile(mxcUrl);
+  const buffer = await downloadMatrixFile(mxcUrl, content.file);
   const fileName = content.body || 'file';
   const mime = content.info?.mimetype || 'application/octet-stream';
 
@@ -909,46 +1191,51 @@ async function buildMediaContentBlocks(event, session) {
 
 // --- Command Handler ---
 
-async function handleCommand(roomId, text, sendReply, sendHtml) {
+async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
   switch (cmd) {
     case '!start': {
-      const existing = sessions.get(roomId);
-      if (existing && existing.alive) {
-        await sendReply(
-          `Session already active (workdir: ${existing.workdir}). Send !stop first.`
-        );
+      if (!sender) {
+        await sendReply('Cannot determine sender. Please try again.');
         return;
       }
 
       const arg = parts[1];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
+      const workdir = explicitWorkdir || DEFAULT_WORKDIR;
 
-      if (!forceFresh && !explicitWorkdir) {
-        const prev = getPersistedSession(roomId);
-        if (prev && prev.sessionId) {
-          const ago = Math.round((Date.now() - prev.lastUsed) / 60000);
-          await sendReply(
-            `Previous session found:\n` +
-            `  Session: ${prev.sessionId.slice(0, 8)}...\n` +
-            `  Workdir: ${prev.workdir}\n` +
-            `  Last used: ${ago} min ago\n\n` +
-            `Reply "resume" to continue, or "!start now" for a fresh session.`
-          );
-          return;
-        }
+      // Create a new room for this session
+      let sessionRoomId;
+      try {
+        sessionRoomId = await createSessionRoom(sender);
+      } catch (e) {
+        console.error('Failed to create session room:', e);
+        await sendReply(`Failed to create session room: ${e.message}`);
+        return;
       }
 
-      const workdir = explicitWorkdir || DEFAULT_WORKDIR;
-      const session = createSession(roomId, workdir);
-      session.sendCallback = sendReply;
-      session.sendHtml = sendHtml;
-      await sendReply(
-        `Session started.\nWorkdir: ${workdir}\nTimeout: ${SESSION_TIMEOUT / 1000}s\n\nSend any message to interact with Claude Code.`
-      );
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+
+      const session = createSession(sessionRoomId, workdir);
+      session.originRoomId = roomId;
+      session.sendCallback = sessionSendReply;
+      session.sendHtml = sessionSendHtml;
+
+      // Confirm in origin room with a link to the new room
+      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      await sendReply(`Session started in new room: ${roomLink}`);
+
+      // Welcome message in the session room
+      const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
+      const welcomeHtml =
+        `<b>Session started</b><br/>` +
+        `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
+        `<i>Send any message to interact with Claude Code.</i>`;
+      await sessionSendHtml(welcomePlain, welcomeHtml);
       break;
     }
 
@@ -960,6 +1247,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       }
       session.proc.kill();
       sessions.delete(roomId);
+      // Append [done] to the session room name
+      try {
+        const nameEvent = await client.getRoomStateEvent(session.roomId, 'm.room.name', '');
+        const currentName = nameEvent?.name || '';
+        if (currentName && !currentName.endsWith('[done]')) {
+          updateRoomName(session.roomId, `${currentName} [done]`);
+        }
+      } catch { /* room name not set */ }
       await sendReply('Session stopped.');
       break;
     }
@@ -978,6 +1273,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const restarted = createSession(roomId, restartWorkdir, restartSessionId);
       restarted.sendCallback = sendReply;
       restarted.sendHtml = sendHtml;
+      restarted.originRoomId = existing.originRoomId;
+      restarted.firstMessageCaptured = existing.firstMessageCaptured;
       await sendReply(
         `Session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}`
       );
@@ -985,69 +1282,106 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
     }
 
     case '!resume': {
-      const existing = sessions.get(roomId);
-      if (existing && existing.alive) {
-        await sendReply(
-          `Session already active (workdir: ${existing.workdir}). Send !stop first.`
-        );
+      if (!sender) {
+        await sendReply('Cannot determine sender. Please try again.');
         return;
       }
 
-      const prev = getPersistedSession(roomId);
       const resumeArg = parts[1]?.replace(/\.+$/, '') || undefined;
 
-      let resumeSessionId = prev?.sessionId;
-      let resumeWorkdir = prev?.workdir || DEFAULT_WORKDIR;
-
-      if (resumeArg) {
-        const encodedPath = resumeWorkdir.replace(/\//g, '-');
-        const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
-
-        if (!fs.existsSync(projectDir)) {
-          await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
-          return;
-        }
-
-        const files = fs.readdirSync(projectDir)
-          .filter(f => f.endsWith('.jsonl'))
-          .map(f => f.replace('.jsonl', ''))
-          .sort((a, b) => {
-            const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
-            const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
-            return sb.mtimeMs - sa.mtimeMs;
-          });
-
-        const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
-        if (!isNaN(num) && num >= 1 && num <= files.length) {
-          resumeSessionId = files[num - 1];
-        } else {
-          const match = files.find(f => f.startsWith(resumeArg));
-          if (match) {
-            resumeSessionId = match;
-          } else {
-            await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
-            return;
-          }
-        }
-      }
-
-      if (!resumeSessionId) {
-        await sendReply(
-          'No previous session found to resume. Send !start to begin a new session.'
-        );
+      if (!resumeArg) {
+        // No arg — show sessions list inline
+        await handleCommand(roomId, '!sessions', sendReply, sendHtml, sender);
         return;
       }
 
-      const session = createSession(roomId, resumeWorkdir, resumeSessionId);
-      session.sendCallback = sendReply;
-      session.sendHtml = sendHtml;
-      await sendReply(
-        `Resuming session ${resumeSessionId.slice(0, 8)}...\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`
-      );
+      const resumeWorkdir = DEFAULT_WORKDIR;
+      const encodedPath = resumeWorkdir.replace(/\//g, '-');
+      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+
+      if (!fs.existsSync(projectDir)) {
+        await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
+        return;
+      }
+
+      const files = fs.readdirSync(projectDir)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => f.replace('.jsonl', ''))
+        .sort((a, b) => {
+          const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
+          const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
+          return sb.mtimeMs - sa.mtimeMs;
+        });
+
+      let resumeSessionId;
+      const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
+      if (!isNaN(num) && num >= 1 && num <= files.length) {
+        resumeSessionId = files[num - 1];
+      } else {
+        const match = files.find(f => f.startsWith(resumeArg));
+        if (match) {
+          resumeSessionId = match;
+        } else {
+          await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
+          return;
+        }
+      }
+
+      // Check if there's already an active room for this Claude session
+      for (const [activeRoomId, activeSession] of sessions) {
+        if (activeSession.claudeSessionId === resumeSessionId && activeSession.alive) {
+          const roomLink = `https://matrix.to/#/${activeRoomId}`;
+          await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active: ${roomLink}`);
+          return;
+        }
+      }
+
+      // Create a new room for the resumed session
+      let sessionRoomId;
+      try {
+        sessionRoomId = await createSessionRoom(sender);
+      } catch (e) {
+        console.error('Failed to create session room:', e);
+        await sendReply(`Failed to create session room: ${e.message}`);
+        return;
+      }
+
+      const shortId = resumeSessionId.slice(0, 8);
+      const summary = getSessionSummary(resumeSessionId, resumeWorkdir);
+      const roomName = summary
+        ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
+        : `${SERVER_LABEL}: Resumed ${shortId}`;
+      await updateRoomName(sessionRoomId, roomName);
+
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+
+      const session = createSession(sessionRoomId, resumeWorkdir, resumeSessionId);
+      session.originRoomId = roomId;
+      session.firstMessageCaptured = true; // don't re-rename on first message
+      session.sendCallback = sessionSendReply;
+      session.sendHtml = sessionSendHtml;
+
+      // Persist immediately — we already know the session ID, don't wait for Claude's event
+      persistSession(sessionRoomId, resumeSessionId, resumeWorkdir, roomId);
+
+      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
+      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`;
+      const resumeHtml =
+        `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
+        `Workdir: <code>${escapeHtml(resumeWorkdir)}</code><br/><br/>` +
+        `<i>Send any message to continue.</i>`;
+      await sessionSendHtml(resumePlain, resumeHtml);
       break;
     }
 
     case '!workdir': {
+      if (!sender) {
+        await sendReply('Cannot determine sender. Please try again.');
+        return;
+      }
+
       const newDir = parts.slice(1).join(' ');
       if (!newDir) {
         const session = sessions.get(roomId);
@@ -1069,18 +1403,32 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         return;
       }
 
-      const existing = sessions.get(roomId);
-      if (existing && existing.alive) {
-        existing.proc.kill();
-        sessions.delete(roomId);
+      // Create a new room for this session
+      let sessionRoomId;
+      try {
+        sessionRoomId = await createSessionRoom(sender);
+      } catch (e) {
+        console.error('Failed to create session room:', e);
+        await sendReply(`Failed to create session room: ${e.message}`);
+        return;
       }
 
-      const session = createSession(roomId, resolved);
-      session.sendCallback = sendReply;
-      session.sendHtml = sendHtml;
-      await sendReply(
-        `Session started in new workdir.\nWorkdir: ${resolved}\nTimeout: ${SESSION_TIMEOUT / 1000}s`
-      );
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
+      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
+
+      const session = createSession(sessionRoomId, resolved);
+      session.originRoomId = roomId;
+      session.sendCallback = sessionSendReply;
+      session.sendHtml = sessionSendHtml;
+
+      const roomLink = `https://matrix.to/#/${sessionRoomId}`;
+      await sendReply(`Session started in new room: ${roomLink}\nWorkdir: ${resolved}`);
+      const wdPlain = `Session started.\nWorkdir: ${resolved}\n\nSend any message to interact with Claude Code.`;
+      const wdHtml =
+        `<b>Session started</b><br/>` +
+        `Workdir: <code>${escapeHtml(resolved)}</code><br/><br/>` +
+        `<i>Send any message to interact with Claude Code.</i>`;
+      await sessionSendHtml(wdPlain, wdHtml);
       break;
     }
 
@@ -1090,15 +1438,29 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         await sendReply('No active session. Send !start to begin.');
         return;
       }
-      const uptime = Math.round((Date.now() - session.startedAt) / 1000);
-      await sendReply(
-        `Session active\n` +
-          `Workdir: ${session.workdir}\n` +
-          `Session ID: ${session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '...' : '(pending)'}\n` +
-          `Uptime: ${uptime}s\n` +
-          `Restarts: ${session.restartCount}/3\n` +
-          `Busy: ${session.busy ? 'yes' : 'no'}`
-      );
+      const uptimeMs = Date.now() - session.startedAt;
+      const shortId = session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '…' : '(pending)';
+      const busyText = session.busy ? 'yes' : 'no';
+
+      const plainStatus =
+        `Session active\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
+        `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
+
+      const busyHtml = session.busy
+        ? color('● busy', '#f0883e')
+        : color('● idle', '#3fb950');
+      const htmlStatus =
+        `<b>Session Status</b><table>` +
+        `<tr><td>State</td><td>${busyHtml}</td></tr>` +
+        `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
+        `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
+        `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
+        `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
+        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
+        `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>` +
+        `</table>`;
+
+      await sendHtml(plainStatus, htmlStatus);
       break;
     }
 
@@ -1134,29 +1496,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
           const sessionId = f.replace('.jsonl', '');
           const filePath = path.join(projectDir, f);
           const stat = fs.statSync(filePath);
-
-          let summary = '';
-          try {
-            const content = fs.readFileSync(filePath, 'utf-8');
-            for (const line of content.split('\n')) {
-              if (!line.trim()) continue;
-              const record = JSON.parse(line);
-              if (record.type === 'user' && record.message) {
-                const msg = record.message;
-                const text = typeof msg.content === 'string'
-                  ? msg.content
-                  : Array.isArray(msg.content)
-                    ? msg.content.find(b => b.type === 'text')?.text || ''
-                    : '';
-                if (text && !text.startsWith('<local-command') && !text.startsWith('<command-name>')) {
-                  summary = text.replace(/<[^>]+>/g, '').trim().slice(0, 80);
-                  if (text.trim().length > 80) summary += '…';
-                  break;
-                }
-              }
-            }
-          } catch {}
-
+          const summary = getSessionSummary(sessionId, workdir);
           return { sessionId, modified: stat.mtimeMs, summary };
         })
         .sort((a, b) => b.modified - a.modified);
@@ -1167,49 +1507,99 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       }
 
       const activeId = currentSession?.claudeSessionId;
-      const list = files.slice(0, 15).map((s, i) => {
+      const items = files.slice(0, 15);
+
+      // Plain text fallback
+      const plainList = items.map((s, i) => {
         const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
         const shortId = s.sessionId.slice(0, 8);
         const active = s.sessionId === activeId ? ' ⚡' : '';
-        const desc = s.summary ? `\n   ${s.summary}` : '';
-        return `${i + 1}. ${shortId} — ${date}${active}${desc}`;
+        const desc = s.summary ? ` — ${s.summary}` : '';
+        return `${i + 1}. ${shortId} ${date}${active}${desc}`;
       }).join('\n');
 
-      await sendReply(
-        `Sessions for ${workdir}:\n\n${list}\n\n` +
-        `Use !resume <number> or !resume <id> to resume a specific session.`
-      );
+      // HTML formatted version
+      const htmlRows = items.map((s, i) => {
+        const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
+        const shortId = s.sessionId.slice(0, 8);
+        const active = s.sessionId === activeId ? ' ⚡' : '';
+        const desc = s.summary
+          ? `<br/><span style="color:gray">${escapeHtml(s.summary)}</span>`
+          : '';
+        return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
+      }).join('\n');
+
+      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse !resume <number> or !resume <id> to resume.`;
+      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>!resume &lt;number&gt;</code> or <code>!resume &lt;id&gt;</code> to resume.</i>`;
+
+      await sendHtml(plainText, html);
       break;
     }
 
     case '!help': {
-      await sendReply(
+      const plainHelp =
         `Available commands:\n\n` +
-          `!start — Start a new Claude Code session\n` +
-          `!start <workdir> — Start in a specific directory\n` +
-          `!start now — Start fresh (skip resume offer)\n` +
-          `!stop — Stop the current session\n` +
-          `!restart — Stop and immediately resume the session\n` +
-          `!resume — Resume the previous session\n` +
-          `!resume <n> — Resume session #n from !sessions list\n` +
-          `!resume <id> — Resume session by ID prefix\n` +
-          `!sessions — List all past sessions\n` +
-          `!workdir <path> — Change working directory (restarts session)\n` +
-          `!status — Show current session info\n` +
-          `!working — Toggle tool call visibility\n` +
-          `!mcp — Show MCP server status\n` +
-          `!model — Show current model\n` +
-          `!cost — Show session cost\n` +
-          `!usage — Show token usage\n` +
-          `!tools — List available tools\n` +
-          `!help — Show this help message\n\n` +
-          `While Claude is working:\n` +
-          `  Messages are queued automatically\n` +
-          `  Send "interrupt" to force interrupt\n\n` +
-          `Claude Code slash commands (e.g. /commit, /review-pr) are passed through directly.\n\n` +
-          `Send any other text to chat with Claude Code.\n\n` +
-          `You can also send photos and documents (PDFs, images, text files) — they'll be forwarded to Claude Code directly.`
-      );
+        `!start — Start a new session (creates a new room)\n` +
+        `!start <workdir> — Start in a specific directory\n` +
+        `!stop — Stop the current session\n` +
+        `!restart — Stop and immediately resume the session\n` +
+        `!resume <n> — Resume session #n from !sessions list\n` +
+        `!resume <id> — Resume session by ID prefix\n` +
+        `!sessions — List all past sessions\n` +
+        `!workdir <path> — Start session in a different directory\n` +
+        `!status — Show current session info\n` +
+        `!working — Toggle tool call visibility\n` +
+        `!mcp — Show MCP server status\n` +
+        `!model — Show current model\n` +
+        `!cost — Show session cost\n` +
+        `!usage — Show token usage\n` +
+        `!tools — List available tools\n` +
+        `!help — Show this help message\n\n` +
+        `Each !start, !resume, and !workdir creates a new encrypted room for the session.\n` +
+        `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
+        `While Claude is working:\n` +
+        `  Messages are queued automatically\n` +
+        `  Send "interrupt" to force interrupt\n\n` +
+        `Claude Code slash commands (e.g. /commit, /review-pr) are passed through directly.\n` +
+        `Send any other text to chat with Claude Code.\n` +
+        `You can also send photos and documents (PDFs, images, text files).`;
+
+      const cmdGroup = (title, cmds) => {
+        const items = cmds.map(([c, d]) => `<li><code>${c}</code> — ${d}</li>`).join('');
+        return `<b>${title}</b><ul>${items}</ul>`;
+      };
+
+      const htmlHelp =
+        cmdGroup('Sessions', [
+          ['!start', 'Start a new session (creates a new room)'],
+          ['!start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['!stop', 'Stop the current session'],
+          ['!restart', 'Stop and immediately resume the session'],
+          ['!resume &lt;n&gt;', 'Resume session #n from !sessions list'],
+          ['!resume &lt;id&gt;', 'Resume session by ID prefix'],
+          ['!sessions', 'List all past sessions'],
+          ['!workdir &lt;path&gt;', 'Start session in a different directory'],
+        ]) +
+        cmdGroup('Info', [
+          ['!status', 'Show current session info'],
+          ['!working', 'Toggle tool call visibility'],
+          ['!mcp', 'Show MCP server status'],
+          ['!model', 'Show current model'],
+          ['!cost', 'Show session cost'],
+          ['!usage', 'Show token usage'],
+          ['!tools', 'List available tools'],
+          ['!help', 'Show this help message'],
+        ]) +
+        `<b>Tips</b><ul>` +
+        `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new encrypted room</li>` +
+        `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
+        `<li>Messages are queued automatically while Claude is working</li>` +
+        `<li>Send <code>interrupt</code> to force interrupt</li>` +
+        `<li>Slash commands (e.g. <code>/commit</code>) are passed through directly</li>` +
+        `<li>You can send photos and documents (PDFs, images, text files)</li>` +
+        `</ul>`;
+
+      await sendHtml(plainHelp, htmlHelp);
       break;
     }
 
@@ -1217,13 +1607,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const session = sessions.get(roomId);
       if (session?.initData?.mcp_servers) {
         const servers = session.initData.mcp_servers;
-        const list = servers.map(s => {
+        const plainList = servers.map(s => {
           const icon = s.status === 'connected' ? '🟢' :
                        s.status === 'failed' ? '🔴' :
                        s.status === 'needs-auth' ? '🟡' : '⚪';
           return `${icon} ${s.name} — ${s.status}`;
         }).join('\n');
-        await sendReply(`MCP Servers (live):\n\n${list}`);
+        const statusDot = (st) => {
+          const clr = st === 'connected' ? '#3fb950' :
+                      st === 'failed' ? '#f85149' :
+                      st === 'needs-auth' ? '#f0883e' : '#8b949e';
+          return color('●', clr);
+        };
+        const htmlRows = servers.map(s =>
+          `<tr><td>${statusDot(s.status)}</td><td><code>${escapeHtml(s.name)}</code></td><td>${escapeHtml(s.status)}</td></tr>`
+        ).join('');
+        const htmlMcp = `<b>MCP Servers</b><table>${htmlRows}</table>`;
+        await sendHtml(`MCP Servers (live):\n\n${plainList}`, htmlMcp);
       } else {
         try {
           const configPath = path.join(__dirname, 'mcp-config.json');
@@ -1262,10 +1662,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         break;
       }
       const cost = session.totalUsage.cost_usd;
-      await sendReply(
-        `Session cost: $${cost.toFixed(4)}\n` +
-        `Turns: ${session.turnCount}`
-      );
+      const costClr = cost < 0.5 ? '#3fb950' : cost < 2 ? '#f0883e' : '#f85149';
+      const plainCost = `Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`;
+      const htmlCost =
+        `<b>Session Cost</b><table>` +
+        `<tr><td>Cost</td><td>${color('$' + cost.toFixed(4), costClr)}</td></tr>` +
+        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
+        `</table>`;
+      await sendHtml(plainCost, htmlCost);
       break;
     }
 
@@ -1276,15 +1680,25 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
         break;
       }
       const u = session.totalUsage;
-      await sendReply(
+      const uCostClr = u.cost_usd < 0.5 ? '#3fb950' : u.cost_usd < 2 ? '#f0883e' : '#f85149';
+      const plainUsage =
         `Token usage (cumulative):\n\n` +
         `Input: ${u.input_tokens.toLocaleString()}\n` +
         `Output: ${u.output_tokens.toLocaleString()}\n` +
         `Cache read: ${u.cache_read.toLocaleString()}\n` +
         `Cache create: ${u.cache_create.toLocaleString()}\n` +
         `Turns: ${session.turnCount}\n` +
-        `Cost: $${u.cost_usd.toFixed(4)}`
-      );
+        `Cost: $${u.cost_usd.toFixed(4)}`;
+      const htmlUsage =
+        `<b>Token Usage</b><table>` +
+        `<tr><td>Input</td><td>${u.input_tokens.toLocaleString()}</td></tr>` +
+        `<tr><td>Output</td><td>${u.output_tokens.toLocaleString()}</td></tr>` +
+        `<tr><td>Cache read</td><td>${u.cache_read.toLocaleString()}</td></tr>` +
+        `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>` +
+        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
+        `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>` +
+        `</table>`;
+      await sendHtml(plainUsage, htmlUsage);
       break;
     }
 
@@ -1297,21 +1711,35 @@ async function handleCommand(roomId, text, sendReply, sendHtml) {
       const tools = session.initData.tools;
       const mcpTools = tools.filter(t => t.startsWith('mcp__'));
       const builtIn = tools.filter(t => !t.startsWith('mcp__'));
-      let msg = `Built-in tools (${builtIn.length}):\n${builtIn.join(', ')}\n\n`;
+
+      // Plain text
+      let plainMsg = `Built-in tools (${builtIn.length}):\n${builtIn.join(', ')}\n\n`;
+      const grouped = {};
+      for (const t of mcpTools) {
+        const tParts = t.split('__');
+        const server = tParts[1] || 'unknown';
+        if (!grouped[server]) grouped[server] = [];
+        grouped[server].push(tParts[2] || t);
+      }
       if (mcpTools.length > 0) {
-        const grouped = {};
-        for (const t of mcpTools) {
-          const parts = t.split('__');
-          const server = parts[1] || 'unknown';
-          if (!grouped[server]) grouped[server] = [];
-          grouped[server].push(parts[2] || t);
-        }
-        msg += `MCP tools:\n`;
+        plainMsg += `MCP tools:\n`;
         for (const [server, serverTools] of Object.entries(grouped)) {
-          msg += `  ${server} (${serverTools.length}): ${serverTools.join(', ')}\n`;
+          plainMsg += `  ${server} (${serverTools.length}): ${serverTools.join(', ')}\n`;
         }
       }
-      await sendReply(msg);
+
+      // HTML
+      let htmlMsg = `<b>Built-in tools (${builtIn.length})</b><br/>` +
+        builtIn.map(t => `<code>${escapeHtml(t)}</code>`).join(', ');
+      if (mcpTools.length > 0) {
+        for (const [server, serverTools] of Object.entries(grouped)) {
+          htmlMsg += `<details><summary><b>${escapeHtml(server)}</b> (${serverTools.length})</summary>` +
+            serverTools.map(t => `<code>${escapeHtml(t)}</code>`).join(', ') +
+            `</details>`;
+        }
+      }
+
+      await sendHtml(plainMsg, htmlMsg);
       break;
     }
 
@@ -1350,7 +1778,7 @@ client.on('room.message', async (roomId, event) => {
     `Message from ${sender} in ${roomId}: ${text.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
   );
 
-  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
+  const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
 
   // Bridge commands use ! prefix
@@ -1362,17 +1790,35 @@ client.on('room.message', async (roomId, event) => {
     ]);
     const cmd = text.split(/\s+/)[0].toLowerCase();
     if (bridgeCommands.has(cmd)) {
-      await handleCommand(roomId, text, sendReply, sendHtmlFn);
+      await handleCommand(roomId, text, sendReply, sendHtmlFn, sender);
       return;
     }
     // Fall through — forward to Claude Code session
   }
 
   // Forward to Claude Code session
-  const session = sessions.get(roomId);
+  let session = sessions.get(roomId);
   if (!session || !session.alive) {
-    await sendReply('No active session. Send !start to begin.');
-    return;
+    // Auto-resume if this room has a persisted session (session-specific room)
+    const prev = getPersistedSession(roomId);
+    if (prev && prev.sessionId) {
+      // Clean up dead session if present
+      if (session) sessions.delete(roomId);
+
+      const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
+      newSession.originRoomId = prev.originRoomId || null;
+      newSession.firstMessageCaptured = true;
+      newSession.sendCallback = sendReply;
+      newSession.sendHtml = sendHtmlFn;
+      session = newSession;
+
+      const shortId = prev.sessionId.slice(0, 8);
+      const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
+      await sendHtmlFn(arNotice.plain, arNotice.html);
+    } else {
+      await sendReply('No active session. Send !start to begin.');
+      return;
+    }
   }
 
   // If Claude Code asked a question, handle the answer
@@ -1392,13 +1838,8 @@ client.on('room.message', async (roomId, event) => {
   if (session.pendingPlan && text.toLowerCase().trim() === 'build') {
     sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
     session.pendingPlan = null;
-    await sendReply('▶️ Building...');
-    return;
-  }
-
-  // Handle "resume" text response (from !start prompt)
-  if (!session.busy && text.toLowerCase().trim() === 'resume') {
-    await handleCommand(roomId, '!resume', sendReply, sendHtmlFn);
+    const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
+    await sendHtmlFn(buildNotice.plain, buildNotice.html);
     return;
   }
 
@@ -1408,14 +1849,18 @@ client.on('room.message', async (roomId, event) => {
     if (lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
-      await sendReply(`⚡ Interrupting Claude...${queued.length > 0 ? ` (sending ${queued.length} queued message${queued.length > 1 ? 's' : ''})` : ''}`);
+      stripQueueNotificationLinks(session);
       if (queued.length > 0) {
+        await sendReply(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
         flushQueue(session, queued);
+      } else {
+        await sendReply('⚡ No queued messages to send.');
       }
       return;
     }
     // Queue the message
     if (!session.queuedMessages) session.queuedMessages = [];
+    if (!session.queueNotifications) session.queueNotifications = [];
 
     if (hasMedia) {
       try {
@@ -1433,7 +1878,20 @@ client.on('room.message', async (roomId, event) => {
     const preview = hasMedia
       ? (event.content.body || '[media]')
       : (text.length > 40 ? text.slice(0, 37) + '…' : text);
-    await sendReply(`📨 Queued (${count}): ${preview}\nSend "interrupt" to force send now.`);
+    const queueIndex = count - 1;
+    const interruptLink = generateActionLink('interrupt', roomId);
+    const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
+    const plainNotif = `📨 Queued (${count}): ${preview}`;
+    if (interruptLink || cancelLink) {
+      const links = [];
+      if (cancelLink) links.push(`<a href="${cancelLink}">✕ Cancel</a>`);
+      if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Send now</a>`);
+      const htmlQueue = `${escapeHtml(plainNotif)}<br/>${links.join(' · ')}`;
+      const notifEventId = await sendHtmlFn(plainNotif, htmlQueue);
+      if (notifEventId) session.queueNotifications.push({ eventId: notifEventId, plain: plainNotif });
+    } else {
+      await sendReply(plainNotif);
+    }
     return;
   }
 
@@ -1448,6 +1906,11 @@ client.on('room.message', async (roomId, event) => {
       }
       if (!sendToSession(session, blocks)) {
         await sendReply('Session is not available. Send !start to begin a new one.');
+      } else if (!session.firstMessageCaptured) {
+        session.firstMessageCaptured = true;
+        const fileName = event.content.body || 'file';
+        const label = `${SERVER_LABEL}: ${fileName.slice(0, 50)}`;
+        updateRoomName(session.roomId, label);
       }
     } catch (err) {
       console.error('Media processing error:', err);
@@ -1456,6 +1919,10 @@ client.on('room.message', async (roomId, event) => {
   } else {
     if (!sendTextToSession(session, text)) {
       await sendReply('Session is not available. Send !start to begin a new one.');
+    } else if (!session.firstMessageCaptured) {
+      session.firstMessageCaptured = true;
+      const summary = text.length > 50 ? text.slice(0, 50) + '…' : text;
+      updateRoomName(session.roomId, `${SERVER_LABEL}: ${summary}`);
     }
   }
   } catch (err) {
@@ -1574,6 +2041,71 @@ const apiServer = createServer((req, res) => {
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
 
+      } else if (url.pathname === '/interrupt') {
+        const { roomId } = data;
+        if (!roomId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId required' }));
+          return;
+        }
+        const session = sessions.get(roomId);
+        if (!session || !session.alive) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No active session for this room' }));
+          return;
+        }
+        const queued = session.queuedMessages || [];
+        session.queuedMessages = null;
+        stripQueueNotificationLinks(session);
+        if (queued.length > 0) {
+          if (session.sendCallback) {
+            session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
+          }
+          flushQueue(session, queued);
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, flushed: queued.length }));
+
+
+      } else if (url.pathname === '/cancel-queued') {
+        const { roomId, index } = data;
+        if (!roomId || typeof index !== 'number') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and index required' }));
+          return;
+        }
+        const session = sessions.get(roomId);
+        if (!session || !session.alive) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No active session for this room' }));
+          return;
+        }
+        const queue = session.queuedMessages;
+        if (!queue || index < 0 || index >= queue.length) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No queued message at that index' }));
+          return;
+        }
+        queue.splice(index, 1);
+        // Edit the notification for this index to remove links
+        const notifs = session.queueNotifications || [];
+        if (index < notifs.length) {
+          const { eventId, plain } = notifs.splice(index, 1)[0];
+          if (eventId) {
+            editMessage(session.roomId, eventId, `✕ ${plain} (cancelled)`);
+          }
+        }
+        const remaining = queue.length;
+        if (remaining === 0) session.queuedMessages = null;
+        if (session.sendCallback) {
+          const msg = remaining === 0
+            ? '✕ Cancelled queued message (queue empty)'
+            : `✕ Cancelled queued message (${remaining} remaining)`;
+          session.sendCallback(msg);
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, remaining }));
+
       } else if (url.pathname === '/message') {
         const { roomId, text } = data;
         if (!roomId || !text) {
@@ -1581,7 +2113,7 @@ const apiServer = createServer((req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, text).then(() => {
+        sendToRoom(roomId, plainTextFormat(text), markdownToHtml(text)).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
