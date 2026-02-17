@@ -1825,7 +1825,7 @@ client.on('room.message', async (roomId, event) => {
 
   if (msgtype === 'm.text' || msgtype === 'm.notice') {
     text = (event.content.body || '').trim();
-  } else if (msgtype === 'm.image' || msgtype === 'm.file') {
+  } else if (msgtype === 'm.image' || msgtype === 'm.file' || msgtype === 'm.audio') {
     hasMedia = true;
     text = (event.content.body || '').trim();
   }
