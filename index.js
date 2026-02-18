@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin, RustSdkCryptoStorageProvider } from 'matrix-bot-sdk';
 import { spawn } from 'child_process';
+import { transcribeAudio } from './lib/transcribe.js';
 import { createServer } from 'http';
 import { createHmac } from 'crypto';
 import fs from 'fs';
@@ -29,6 +30,8 @@ const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
 // Server label for room names: "dev-2" → "D2", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
@@ -1153,7 +1156,10 @@ async function buildMediaContentBlocks(event, session) {
   const fileName = content.body || 'file';
   const mime = content.info?.mimetype || 'application/octet-stream';
 
-  if (content.msgtype === 'm.image') {
+  if (content.msgtype === 'm.audio') {
+    const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
+    blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
+  } else if (content.msgtype === 'm.image') {
     blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
@@ -1767,7 +1773,7 @@ client.on('room.message', async (roomId, event) => {
 
   if (msgtype === 'm.text' || msgtype === 'm.notice') {
     text = (event.content.body || '').trim();
-  } else if (msgtype === 'm.image' || msgtype === 'm.file') {
+  } else if (msgtype === 'm.image' || msgtype === 'm.file' || msgtype === 'm.audio') {
     hasMedia = true;
     text = (event.content.body || '').trim();
   }
@@ -1899,11 +1905,31 @@ client.on('room.message', async (roomId, event) => {
 
   if (hasMedia) {
     try {
+      // Show transcription status for voice notes
+      let statusEventId = null;
+      if (msgtype === 'm.audio') {
+        const transcribeNotice = notice('info', 'Transcribing voice note...', 'Transcribing voice note…');
+        statusEventId = await sendHtmlFn(transcribeNotice.plain, transcribeNotice.html);
+      }
+
       const blocks = await buildMediaContentBlocks(event, session);
       if (blocks.length === 0) {
-        await sendReply('Could not process the file.');
+        if (statusEventId) await editMessage(roomId, statusEventId, 'Voice note transcription failed', notice('error', 'Voice note transcription failed', 'Voice note transcription failed').html);
+        else await sendReply('Could not process the file.');
         return;
       }
+
+      // Update status with transcription preview
+      if (statusEventId && msgtype === 'm.audio') {
+        const transcriptionBlock = blocks.find(b => b.type === 'text' && b.text.startsWith('[Voice note transcription]'));
+        if (transcriptionBlock) {
+          const preview = transcriptionBlock.text.replace('[Voice note transcription]: ', '');
+          const truncated = preview.length > 100 ? preview.slice(0, 97) + '…' : preview;
+          const doneNotice = notice('success', `Transcribed: ${truncated}`, `Transcribed: ${escapeHtml(truncated)}`);
+          await editMessage(roomId, statusEventId, doneNotice.plain, doneNotice.html);
+        }
+      }
+
       if (!sendToSession(session, blocks)) {
         await sendReply('Session is not available. Send !start to begin a new one.');
       } else if (!session.firstMessageCaptured) {
