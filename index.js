@@ -4,7 +4,7 @@ import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin, RustSdkCrypt
 import { spawn } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
 import { createServer } from 'http';
-import { createHmac } from 'crypto';
+import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -43,6 +43,8 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
+const SECRETS_DIR = path.join(os.homedir(), '.secrets');
+const SECRET_TTL_MS = 3600000; // 1 hour
 
 // Plan file patterns — files that get a "view in browser" link
 const PLAN_FILE_PATTERNS = [
@@ -63,6 +65,14 @@ function generateActionLink(action, roomId, extras) {
   const payload = Buffer.from(JSON.stringify({ action, roomId, exp, ...extras })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/action?token=${payload}.${sig}`;
+}
+
+function generateSecretLink(secretId, label, roomId) {
+  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
+  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
+  const payload = Buffer.from(JSON.stringify({ secretId, label, roomId, exp })).toString('base64url');
+  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
+  return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
 }
 
 function isPlanFile(filePath) {
@@ -1983,6 +1993,7 @@ client.on('room.message', async (roomId, event) => {
 
 const pendingMcpQuestions = new Map();
 let mcpQuestionCounter = 0;
+const pendingSecrets = new Map();
 
 // --- Local HTTP API ---
 
@@ -2004,6 +2015,23 @@ const apiServer = createServer((req, res) => {
     res.end(JSON.stringify({ answered: q.answered, answer: q.answer || null }));
     if (q.answered) {
       pendingMcpQuestions.delete(questionId);
+    }
+    return;
+  }
+
+  // GET /secret/:id — MCP server polls for secret submission
+  if (req.method === 'GET' && url.pathname.startsWith('/secret/')) {
+    const secretId = url.pathname.split('/')[2];
+    const s = pendingSecrets.get(secretId);
+    if (!s) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Secret request not found' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ answered: s.answered, path: s.path || null }));
+    if (s.answered) {
+      pendingSecrets.delete(secretId);
     }
     return;
   }
@@ -2070,6 +2098,84 @@ const apiServer = createServer((req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ questionId }));
+        return;
+      }
+
+      if (url.pathname === '/secret') {
+        const { label } = data;
+        if (!label) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'label is required' }));
+          return;
+        }
+
+        const secretId = randomUUID();
+
+        pendingSecrets.set(secretId, {
+          label,
+          answered: false,
+          path: null,
+        });
+
+        // Find active session and send the link to its room
+        let activeSession = null;
+        for (const [, s] of sessions) {
+          if (s.alive) { activeSession = s; break; }
+        }
+
+        if (activeSession) {
+          const link = generateSecretLink(secretId, label, activeSession.roomId);
+          if (link && activeSession.sendHtml) {
+            const plain = `🔐 Secret requested: ${label} — Enter secret: ${link}`;
+            const html = `🔐 Secret requested: <b>${escapeHtml(label)}</b> — <a href="${link}">Enter secret</a>`;
+            activeSession.sendHtml(plain, html);
+          } else if (activeSession.sendCallback) {
+            activeSession.sendCallback(`🔐 Secret requested: ${label} (viewer not configured)`);
+          }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ secretId }));
+        return;
+      }
+
+      const secretSubmitMatch = url.pathname.match(/^\/secret\/([^/]+)\/submit$/);
+      if (secretSubmitMatch) {
+        const secretId = secretSubmitMatch[1];
+        const s = pendingSecrets.get(secretId);
+        if (!s) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'Secret request not found or already submitted' }));
+          return;
+        }
+
+        const { value } = data;
+        if (!value) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'value is required' }));
+          return;
+        }
+
+        // Write secret to file
+        const filePath = path.join(SECRETS_DIR, `${secretId}.txt`);
+        try {
+          fs.writeFileSync(filePath, value, { mode: 0o600 });
+        } catch (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: `Failed to write secret: ${err.message}` }));
+          return;
+        }
+
+        s.answered = true;
+        s.path = filePath;
+
+        // Schedule cleanup after 1 hour
+        setTimeout(() => {
+          fs.unlink(filePath, () => {});
+        }, SECRET_TTL_MS);
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, path: filePath }));
         return;
       }
 
@@ -2203,6 +2309,11 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
 // --- Startup ---
 
 async function main() {
+  // Ensure secrets directory exists with restricted permissions
+  try {
+    await fs.promises.mkdir(SECRETS_DIR, { mode: 0o700, recursive: true });
+  } catch {}
+
   botUserId = await client.getUserId();
   console.log(`Bot logged in as ${botUserId}`);
   console.log(`Homeserver: ${MATRIX_HOMESERVER_URL}`);
