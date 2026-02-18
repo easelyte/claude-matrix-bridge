@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// MCP server that provides an ask_matrix_user tool.
+// MCP server that provides an ask_user tool.
 // When called, it posts the question to the bridge's HTTP API,
 // then polls for the user's answer.
 
@@ -13,13 +13,13 @@ const POLL_INTERVAL_MS = 500;
 const POLL_TIMEOUT_MS = 300000; // 5 min max wait
 
 const server = new McpServer({
-  name: 'ask-matrix-user',
+  name: 'ask-user',
   version: '1.0.0',
 });
 
 server.tool(
-  'ask_matrix_user',
-  'Ask the Matrix user a question with optional multiple-choice options. Use this instead of AskUserQuestion when you need user input.',
+  'ask_user',
+  'Ask the user a question with optional multiple-choice options. Use this instead of AskUserQuestion when you need user input.',
   {
     question: z.string().describe('The question to ask the user'),
     header: z.string().optional().describe('Short label for the question (max 12 chars)'),

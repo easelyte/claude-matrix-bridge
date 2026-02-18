@@ -72,7 +72,7 @@ Any other message is forwarded directly to Claude Code. Claude Code slash comman
 ```
 claude-matrix-bridge/
 ├── index.js              # Main bridge
-├── ask-matrix-user.js    # MCP server for user questions
+├── ask-user.js           # MCP server for user questions
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/
 │   └── server.js         # HMAC-signed file viewer
