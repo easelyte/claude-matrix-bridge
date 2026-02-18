@@ -13,6 +13,8 @@ if (!SECRET) {
 }
 
 const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 // Generate a signed token for a file path
 // Token format: base64url(json({path, exp})) + '.' + hmac
@@ -72,6 +74,62 @@ function renderHtml(filename, content) {
   <pre><code class="${langClass}">${escaped}</code></pre>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script>hljs.highlightAll();</script>
+</body>
+</html>`;
+}
+
+function renderSecretForm(label, token) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Enter Secret</title>
+  <style>
+    body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 480px; width: 100%; }
+    h2 { margin: 0 0 8px; font-size: 18px; }
+    .label { color: #8b949e; margin-bottom: 20px; font-size: 14px; }
+    input[type="password"] { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; box-sizing: border-box; }
+    input[type="password"]:focus { outline: none; border-color: #58a6ff; }
+    button { margin-top: 16px; padding: 10px 24px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%; }
+    button:hover { background: #2ea043; }
+    .note { margin-top: 12px; font-size: 12px; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🔐 Enter Secret</h2>
+    <div class="label">${label.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+    <form method="POST" action="/secret">
+      <input type="hidden" name="token" value="${token}">
+      <input type="password" name="value" placeholder="Paste secret here..." autofocus required>
+      <button type="submit">Submit</button>
+    </form>
+    <div class="note">This value will be written to a secure file and auto-deleted after 1 hour. It will not appear in chat.</div>
+  </div>
+</body>
+</html>`;
+}
+
+function renderSecretSuccess() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Secret Submitted</title>
+  <style>
+    body { margin: 0; background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { text-align: center; padding: 40px; }
+    h2 { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>✅ Secret submitted</h2>
+    <p>The secret has been securely saved. You can close this tab.</p>
+  </div>
 </body>
 </html>`;
 }
@@ -143,6 +201,46 @@ app.get('/action', async (req, res) => {
 </html>`);
   } catch (err) {
     console.error('Action proxy error:', err);
+    res.status(500).send('Failed to reach bridge API');
+  }
+});
+
+app.get('/secret', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  if (!data) return res.status(403).send('Invalid or expired token');
+  if (!data.secretId || !data.label) return res.status(400).send('Invalid secret token');
+
+  res.type('html').send(renderSecretForm(data.label, token));
+});
+
+app.post('/secret', async (req, res) => {
+  const { token, value } = req.body;
+  if (!token || !value) return res.status(400).send('Missing token or value');
+
+  const data = verifyToken(token);
+  if (!data) return res.status(403).send('Invalid or expired token');
+  if (!data.secretId) return res.status(400).send('Invalid secret token');
+
+  try {
+    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/secret/${data.secretId}/submit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.text();
+      return res.status(resp.status).type('html').send(
+        `<!DOCTYPE html><html><body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;"><div><h2>Submission failed</h2><p>${err}</p></div></body></html>`
+      );
+    }
+
+    res.type('html').send(renderSecretSuccess());
+  } catch (err) {
+    console.error('Secret submit proxy error:', err);
     res.status(500).send('Failed to reach bridge API');
   }
 });
