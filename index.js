@@ -2009,7 +2009,7 @@ const pendingSecrets = new Map();
 
 // --- Local HTTP API ---
 
-const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || process.env.API_PORT || '9802', 10);
+const API_PORT = parseInt(process.env.MATRIX_BRIDGE_API_PORT || '9802', 10);
 
 const apiServer = createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
