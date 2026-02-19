@@ -30,7 +30,7 @@ npm start
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
-| `API_PORT` | MCP question API port | `9802` |
+| `MATRIX_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `PORT` | File viewer port | `9803` |
 
 ## Commands

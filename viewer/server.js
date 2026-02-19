@@ -155,7 +155,7 @@ app.get('/view', async (req, res) => {
   }
 });
 
-const BRIDGE_API_PORT = process.env.BRIDGE_API_PORT || 9802;
+const BRIDGE_API_PORT = process.env.MATRIX_BRIDGE_API_PORT || process.env.BRIDGE_API_PORT || 9802;
 
 app.get('/action', async (req, res) => {
   const { token } = req.query;
