@@ -1987,18 +1987,31 @@ client.on('room.message', async (roomId, event) => {
       ? (event.content.body || '[media]')
       : (text.length > 40 ? text.slice(0, 37) + '…' : text);
     const queueIndex = count - 1;
-    const interruptLink = generateActionLink('interrupt', roomId);
-    const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
     const plainNotif = `📨 Queued (${count}): ${preview}`;
-    if (interruptLink || cancelLink) {
-      const links = [];
-      if (cancelLink) links.push(`<a href="${cancelLink}">✕ Cancel</a>`);
-      if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Send now</a>`);
-      const htmlQueue = `${escapeHtml(plainNotif)}<br/>${links.join(' · ')}`;
-      const notifEventId = await sendHtmlFn(plainNotif, htmlQueue);
+    if (session.sendButtonMessage) {
+      const buttons = [
+        { id: 'cancel', label: '✕ Cancel', value: `cancel:${queueIndex}` },
+        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
+      ];
+      const htmlQueue = escapeHtml(plainNotif);
+      const notifEventId = await session.sendButtonMessage(
+        plainNotif, buttons, 'pick_one', plainNotif, htmlQueue
+      );
       if (notifEventId) session.queueNotifications.push({ eventId: notifEventId, plain: plainNotif });
     } else {
-      await sendReply(plainNotif);
+      // Fallback to signed links (existing behavior)
+      const interruptLink = generateActionLink('interrupt', roomId);
+      const cancelLink = generateActionLink('cancel', roomId, { index: queueIndex });
+      if (interruptLink || cancelLink) {
+        const links = [];
+        if (cancelLink) links.push(`<a href="${cancelLink}">✕ Cancel</a>`);
+        if (interruptLink) links.push(`<a href="${interruptLink}">⚡ Send now</a>`);
+        const htmlQueue = `${escapeHtml(plainNotif)}<br/>${links.join(' · ')}`;
+        const notifEventId = await sendHtmlFn(plainNotif, htmlQueue);
+        if (notifEventId) session.queueNotifications.push({ eventId: notifEventId, plain: plainNotif });
+      } else {
+        await sendReply(plainNotif);
+      }
     }
     return;
   }
