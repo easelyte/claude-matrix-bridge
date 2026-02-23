@@ -28,14 +28,15 @@ server.tool(
       label: z.string().describe('Option label (1-5 words)'),
       description: z.string().optional().describe('Description of this option'),
     })).optional().describe('Multiple choice options. Omit for free-text questions.'),
+    multiSelect: z.boolean().optional().describe('If true, user can select multiple options before submitting. Defaults to false (pick one).'),
   },
-  async ({ question, header, options }) => {
+  async ({ question, header, options, multiSelect }) => {
     try {
       // Post question to bridge
       const postRes = await fetch(`${BRIDGE_API}/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, header, options, roomId: ROOM_ID }),
+        body: JSON.stringify({ question, header, options, multiSelect: multiSelect || false, roomId: ROOM_ID }),
       });
 
       if (!postRes.ok) {

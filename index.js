@@ -10,6 +10,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // --- Config ---
 
@@ -39,11 +40,11 @@ fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(mcpConfig, null, 2));
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
-// Server label for room names: "dev-2" → "D2", fallback to SERVER_LABEL env var
+// Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
   const hostname = os.hostname();
   const match = hostname.match(/^(\w+)-(\d+)/);
-  if (match) return match[1].charAt(0).toUpperCase() + match[2];
+  if (match) return match[2]; // Just the number
   return hostname.slice(0, 4).toUpperCase();
 })();
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
@@ -52,6 +53,9 @@ const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 
+// Gemini client for room topic summarization
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 
 function generateFileLink(filePath) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
@@ -104,9 +108,10 @@ function savePersistedSessions(data) {
   }
 }
 
-function persistSession(roomId, sessionId, workdir, originRoomId) {
+function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const data = loadPersistedSessions();
-  data[String(roomId)] = { sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null };
+  const existing = data[String(roomId)] || {};
+  data[String(roomId)] = { ...existing, sessionId, workdir, lastUsed: Date.now(), originRoomId: originRoomId || null, ...(extra || {}) };
   savePersistedSessions(data);
 }
 
@@ -128,7 +133,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
-    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.',
+    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.\nExitPlanMode is handled by the bridge — when you call it, the bridge will show the plan to the user and wait for their approval before continuing.',
     '--include-partial-messages',
     '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify({
@@ -168,7 +173,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
-    pendingPlanDenialId: null,
+    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
     sendHtml: null,
     showWorking: false,
     alive: true,
@@ -187,6 +192,10 @@ function createSession(roomId, workdir, resumeSessionId) {
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
+    // Chat history for topic summarization
+    chatHistory: [],         // { role, text } - full messages (code/tools stripped)
+    pinnedSummaryEventId: null, // event ID of pinned summary message
+    pendingWelcome: true,    // whether to send welcome on user join
   };
 
   // Parse newline-delimited JSON from stdout
@@ -378,6 +387,7 @@ function sendAllQuestions(session) {
         : (q.header ? `${q.header}\n\n${q.question}` : q.question);
 
       const mode = q.multiSelect ? 'pick_many' : 'pick_one';
+      console.log(`[BUTTONS] sendAllQuestions: q.multiSelect=${q.multiSelect}, mode=${mode}`);
       session.sendButtonMessage(prompt, buttons, mode, plainText, html);
     } else if (session.sendHtml) {
       session.sendHtml(plainText, html);
@@ -469,6 +479,14 @@ function handleClaudeEvent(session, event) {
     console.log(`Captured session ID for room ${session.roomId}: ${session.claudeSessionId}`);
   }
 
+  // Log all event types for plan mode debugging
+  if (event.type) {
+    const extras = [];
+    if (event.permission_denials?.length) extras.push(`denials=${JSON.stringify(event.permission_denials)}`);
+    if (event.subtype) extras.push(`subtype=${event.subtype}`);
+    console.log(`[PLAN-DEBUG] Event type=${event.type}${extras.length ? ' | ' + extras.join(' | ') : ''}`);
+  }
+
   switch (event.type) {
     case 'assistant': {
       const content = event.message?.content;
@@ -501,6 +519,18 @@ function handleClaudeEvent(session, event) {
 
         const toolName = block.name;
         const input = block.input || {};
+
+        if (toolName === 'ExitPlanMode') {
+          console.log(`[PLAN-DEBUG] Tool call: ExitPlanMode | block.id: ${block.id} | input keys: ${Object.keys(input).join(',')}`);
+          // Persist the tool_use_id so "build" can send a tool_result even after bridge restart
+          session.pendingPlanDenialId = block.id;
+          if (session.claudeSessionId) {
+            persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: block.id });
+          }
+        }
+        if (toolName === 'EnterPlanMode') {
+          console.log(`[PLAN-DEBUG] Tool call: EnterPlanMode | block.id: ${block.id}`);
+        }
 
         if (toolName === 'AskUserQuestion') {
           debug(`AskUserQuestion tool_use block.id=${block.id}, waitingForAnswer=${session.waitingForAnswer}, input keys=${Object.keys(input).join(',')}`);
@@ -668,8 +698,10 @@ function handleClaudeEvent(session, event) {
 
       // Check for ExitPlanMode permission denial — present Build prompt
       const denials = event.permission_denials || [];
+      console.log(`[PLAN-DEBUG] Room ${session.roomId} | result event | denials: ${JSON.stringify(denials)} | pendingPlan: ${!!session.pendingPlan}`);
       const planDenial = denials.find(d => d.tool_name === 'ExitPlanMode');
       if (planDenial && session.sendCallback) {
+        console.log(`[PLAN-DEBUG] ExitPlanMode denial found! tool_use_id: ${planDenial.tool_use_id} | plan length: ${(planDenial.tool_input?.plan || '').length}`);
         const planText = planDenial.tool_input?.plan || '';
         session.pendingPlan = planText;
         session.pendingPlanDenialId = planDenial.tool_use_id;
@@ -698,6 +730,7 @@ function handleClaudeEvent(session, event) {
         }
         flushQueue(session, queued);
       }
+
       break;
     }
 
@@ -783,6 +816,20 @@ function flushResponse(session) {
   session.responseBuffer = '';
 
   if (!text) return;
+
+  // Track assistant response for topic summarization (strip code blocks)
+  const cleanText = text.replace(/```[\s\S]*?```/g, '').trim();
+  if (cleanText) {
+    if (!session.chatHistory) session.chatHistory = [];
+    session.chatHistory.push({ role: 'assistant', text: cleanText });
+    debug(`Added assistant message to chatHistory, length now: ${session.chatHistory.length}`);
+    // Persist chatHistory for resume across restarts
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+    }
+    // Update room name and pinned summary after adding message
+    maybeUpdatePinnedSummary(session);
+  }
 
   if (session.sendCallback) {
     const chunks = splitMessage(text);
@@ -936,9 +983,9 @@ function markdownToHtml(text) {
         const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
         const lineCount = inner.split('\n').length;
         if (lineCount > 15) {
-          return `<details><summary>Code (${lineCount} lines)</summary><pre>${escapeHtml(inner)}</pre></details>`;
+          return `<details><summary>Code (${lineCount} lines)</summary><pre><code>${escapeHtml(inner)}</code></pre></details>`;
         }
-        return `<pre>${escapeHtml(inner)}</pre>`;
+        return `<pre><code>${escapeHtml(inner)}</code></pre>`;
       }
       return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
     }
@@ -987,8 +1034,24 @@ function markdownToHtml(text) {
     return `<ul>${match}</ul>`;
   });
 
+  // Protect newlines inside <pre> blocks before converting to <br/>
+  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
+    return '<pre><code>' + inner.replace(/\n/g, '&#10;') + '</code></pre>';
+  });
+  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
+    return '<pre>' + inner.replace(/\n/g, '&#10;') + '</pre>';
+  });
+
   // Convert newlines to <br/> (but not before/after block elements)
   html = html.replace(/\n/g, '<br/>');
+
+  // Restore newlines in <pre> blocks
+  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
+    return '<pre><code>' + inner.replace(/&#10;/g, '\n') + '</code></pre>';
+  });
+  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
+    return '<pre>' + inner.replace(/&#10;/g, '\n') + '</pre>';
+  });
 
   // Clean up excessive <br/> around block elements
   html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
@@ -1082,6 +1145,7 @@ async function sendToRoom(roomId, text, html) {
 }
 
 async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
+  console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const content = {
     msgtype: 'm.text',
     body: fallbackBody,
@@ -1104,6 +1168,23 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
 
 // --- Room Management ---
 
+const MATRON_COMMANDS = [
+  { command: 'start', args: '[workdir]', description: 'Start a new session' },
+  { command: 'stop', description: 'Stop the current session' },
+  { command: 'restart', description: 'Stop and immediately resume' },
+  { command: 'resume', args: '<n|id>', description: 'Resume a past session' },
+  { command: 'sessions', description: 'List past sessions' },
+  { command: 'workdir', args: '<path>', description: 'Start in a specific directory' },
+  { command: 'status', description: 'Show session info' },
+  { command: 'working', description: 'Toggle tool call visibility' },
+  { command: 'mcp', description: 'Show MCP server status' },
+  { command: 'model', description: 'Show current model' },
+  { command: 'cost', description: 'Show session cost' },
+  { command: 'usage', description: 'Show token usage' },
+  { command: 'tools', description: 'List available tools' },
+  { command: 'help', description: 'Show all commands' },
+];
+
 async function createSessionRoom(inviteUserId) {
   const roomId = await client.createRoom({
     preset: 'private_chat',
@@ -1114,6 +1195,11 @@ async function createSessionRoom(inviteUserId) {
         type: 'm.room.encryption',
         state_key: '',
         content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      },
+      {
+        type: 'chat.matron.commands',
+        state_key: '',
+        content: { commands: MATRON_COMMANDS },
       },
     ],
   });
@@ -1156,6 +1242,112 @@ async function updateRoomName(roomId, name) {
     await client.sendStateEvent(roomId, 'm.room.name', '', { name });
   } catch (e) {
     debug(`Failed to update room name: ${e.message}`);
+  }
+}
+
+async function maybeUpdatePinnedSummary(session) {
+  if (!genAI) {
+    debug('Skipping summary: genAI not configured');
+    return;
+  }
+
+  if (!session.chatHistory) session.chatHistory = [];
+  debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
+
+  // Trigger every 10 messages
+  if (session.chatHistory.length < 10 || session.chatHistory.length % 10 !== 0) return;
+
+  try {
+    // Get current pinned summary content
+    let currentSummary = '';
+    let bulletCount = 0;
+    if (session.pinnedSummaryEventId) {
+      try {
+        const event = await client.getEvent(session.roomId, session.pinnedSummaryEventId);
+        currentSummary = event.content?.body || '';
+        // Remove "📌 Session Summary\n\n" prefix if present
+        currentSummary = currentSummary.replace(/^📌 Session Summary\n\n/, '');
+        // Count existing bullets
+        bulletCount = (currentSummary.match(/^•/gm) || []).length;
+      } catch (e) {
+        // Pinned message was deleted or inaccessible
+        session.pinnedSummaryEventId = null;
+      }
+    }
+
+    const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
+
+    // Check if we need to compact (>15 bullets)
+    if (bulletCount > 15 && currentSummary) {
+      const compactPrompt = `Condense this session summary into 3-5 key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
+      const compactResult = await model.generateContent(compactPrompt);
+      currentSummary = compactResult.response.text().trim();
+      bulletCount = 0; // Reset after compacting
+    }
+
+    // Get last 10 messages for summarization
+    const recentMessages = session.chatHistory.slice(-10).map(m =>
+      `${m.role}: ${m.text}`
+    ).join('\n\n');
+
+    const prompt = currentSummary
+      ? `Based on these 10 recent messages, provide:\n1. A 2-3 word noun phrase title (topic/feature being worked on - avoid verbs, prefer nouns like "plan mode fix" not "fixing plan mode")\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
+      : `Based on these messages, provide:\n1. A 2-3 word noun phrase title (topic/feature - avoid verbs, prefer nouns like "bridge summarization" not "adding summaries")\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
+
+    const result = await model.generateContent(prompt);
+    const text = result.response.text().trim();
+    const titleMatch = text.match(/TITLE:\s*(.+)/i);
+    const summaryMatch = text.match(/SUMMARY:\s*(.+)/i);
+    const newMatch = text.match(/NEW:\s*(.+)/i);
+
+    const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+
+    // Update room name (keep short - UI truncates around 30 chars)
+    if (titleMatch) {
+      const name = `${SERVER_LABEL}:${sessionShort} ${titleMatch[1].trim().slice(0, 30)}`;
+      updateRoomName(session.roomId, name);
+    }
+
+    // Build cumulative summary for pinned message
+    let updatedSummary = '';
+    if (newMatch && currentSummary) {
+      updatedSummary = `${currentSummary}\n• ${newMatch[1].trim()}`;
+    } else if (summaryMatch) {
+      updatedSummary = summaryMatch[1].trim();
+    }
+
+    if (updatedSummary) {
+      const plainText = `📌 Session Summary\n\n${updatedSummary}`;
+      const htmlText = `<b>📌 Session Summary</b><br/><br/>${escapeHtml(updatedSummary).replace(/\n/g, '<br/>')}`;
+
+      if (session.pinnedSummaryEventId) {
+        // Edit existing pinned message
+        await editMessage(session.roomId, session.pinnedSummaryEventId, plainText, htmlText);
+      } else {
+        // Create new pinned message
+        const eventId = await client.sendMessage(session.roomId, {
+          msgtype: 'm.text',
+          body: plainText,
+          format: 'org.matrix.custom.html',
+          formatted_body: htmlText,
+        });
+        session.pinnedSummaryEventId = eventId;
+
+        // Pin the message
+        try {
+          const pinnedEvents = await client.getRoomStateEvent(session.roomId, 'm.room.pinned_events', '').catch(() => ({ pinned: [] }));
+          const pinned = Array.isArray(pinnedEvents?.pinned) ? pinnedEvents.pinned : [];
+          if (!pinned.includes(eventId)) {
+            pinned.push(eventId);
+            await client.sendStateEvent(session.roomId, 'm.room.pinned_events', '', { pinned });
+          }
+        } catch (e) {
+          debug(`Failed to pin message: ${e.message}`);
+        }
+      }
+    }
+  } catch (e) {
+    debug(`Failed to update pinned summary: ${e.message}`);
   }
 }
 
@@ -1226,6 +1418,10 @@ async function buildMediaContentBlocks(event, session) {
     const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
   } else if (content.msgtype === 'm.image') {
+    // Save image to workdir
+    const imgPath = deduplicateFilename(session.workdir, fileName);
+    fs.writeFileSync(imgPath, buffer);
+    blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
       type: 'image',
       source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
@@ -1304,13 +1500,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Session started in new room: ${roomLink}`);
 
-      // Welcome message in the session room
-      const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
-      const welcomeHtml =
-        `<b>Session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
-        `<i>Send any message to interact with Claude Code.</i>`;
-      await sessionSendHtml(welcomePlain, welcomeHtml);
+      // Welcome message will be sent when user joins (see room.join handler)
       break;
     }
 
@@ -1612,8 +1802,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
       }).join('\n');
 
-      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse !resume <number> or !resume <id> to resume.`;
-      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>!resume &lt;number&gt;</code> or <code>!resume &lt;id&gt;</code> to resume.</i>`;
+      const plainText = `Sessions for ${workdir}:\n\n${plainList}\n\nUse /resume <number> or /resume <id> to resume.`;
+      const html = `<b>Sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume &lt;number&gt;</code> or <code>/resume &lt;id&gt;</code> to resume.</i>`;
 
       await sendHtml(plainText, html);
       break;
@@ -1622,28 +1812,27 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     case '!help': {
       const plainHelp =
         `Available commands:\n\n` +
-        `!start — Start a new session (creates a new room)\n` +
-        `!start <workdir> — Start in a specific directory\n` +
-        `!stop — Stop the current session\n` +
-        `!restart — Stop and immediately resume the session\n` +
-        `!resume <n> — Resume session #n from !sessions list\n` +
-        `!resume <id> — Resume session by ID prefix\n` +
-        `!sessions — List all past sessions\n` +
-        `!workdir <path> — Start session in a different directory\n` +
-        `!status — Show current session info\n` +
-        `!working — Toggle tool call visibility\n` +
-        `!mcp — Show MCP server status\n` +
-        `!model — Show current model\n` +
-        `!cost — Show session cost\n` +
-        `!usage — Show token usage\n` +
-        `!tools — List available tools\n` +
-        `!help — Show this help message\n\n` +
-        `Each !start, !resume, and !workdir creates a new encrypted room for the session.\n` +
+        `/start — Start a new session (creates a new room)\n` +
+        `/start <workdir> — Start in a specific directory\n` +
+        `/stop — Stop the current session\n` +
+        `/restart — Stop and immediately resume the session\n` +
+        `/resume <n> — Resume session #n from /sessions list\n` +
+        `/resume <id> — Resume session by ID prefix\n` +
+        `/sessions — List all past sessions\n` +
+        `/workdir <path> — Start session in a different directory\n` +
+        `/status — Show current session info\n` +
+        `/working — Toggle tool call visibility\n` +
+        `/mcp — Show MCP server status\n` +
+        `/model — Show current model\n` +
+        `/cost — Show session cost\n` +
+        `/usage — Show token usage\n` +
+        `/tools — List available tools\n` +
+        `/help — Show this help message\n\n` +
+        `Each /start, /resume, and /workdir creates a new encrypted room for the session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
         `  Send "interrupt" to force interrupt\n\n` +
-        `Claude Code slash commands (e.g. /commit, /review-pr) are passed through directly.\n` +
         `Send any other text to chat with Claude Code.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
@@ -1654,31 +1843,30 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const htmlHelp =
         cmdGroup('Sessions', [
-          ['!start', 'Start a new session (creates a new room)'],
-          ['!start &lt;workdir&gt;', 'Start in a specific directory'],
-          ['!stop', 'Stop the current session'],
-          ['!restart', 'Stop and immediately resume the session'],
-          ['!resume &lt;n&gt;', 'Resume session #n from !sessions list'],
-          ['!resume &lt;id&gt;', 'Resume session by ID prefix'],
-          ['!sessions', 'List all past sessions'],
-          ['!workdir &lt;path&gt;', 'Start session in a different directory'],
+          ['/start', 'Start a new session (creates a new room)'],
+          ['/start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['/stop', 'Stop the current session'],
+          ['/restart', 'Stop and immediately resume the session'],
+          ['/resume &lt;n&gt;', 'Resume session #n from /sessions list'],
+          ['/resume &lt;id&gt;', 'Resume session by ID prefix'],
+          ['/sessions', 'List all past sessions'],
+          ['/workdir &lt;path&gt;', 'Start session in a different directory'],
         ]) +
         cmdGroup('Info', [
-          ['!status', 'Show current session info'],
-          ['!working', 'Toggle tool call visibility'],
-          ['!mcp', 'Show MCP server status'],
-          ['!model', 'Show current model'],
-          ['!cost', 'Show session cost'],
-          ['!usage', 'Show token usage'],
-          ['!tools', 'List available tools'],
-          ['!help', 'Show this help message'],
+          ['/status', 'Show current session info'],
+          ['/working', 'Toggle tool call visibility'],
+          ['/mcp', 'Show MCP server status'],
+          ['/model', 'Show current model'],
+          ['/cost', 'Show session cost'],
+          ['/usage', 'Show token usage'],
+          ['/tools', 'List available tools'],
+          ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
-        `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new encrypted room</li>` +
+        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new encrypted room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
-        `<li>Slash commands (e.g. <code>/commit</code>) are passed through directly</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
@@ -1864,16 +2052,19 @@ client.on('room.message', async (roomId, event) => {
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
 
-  // Bridge commands use ! prefix
-  if (text.startsWith('!')) {
-    const bridgeCommands = new Set([
-      '!start', '!stop', '!restart', '!resume', '!workdir', '!status',
-      '!show', '!show_working', '!working', '!sessions', '!help',
-      '!mcp', '!model', '!cost', '!usage', '!tools',
+  // Bridge commands use / or ! prefix
+  if (text.startsWith('!') || text.startsWith('/')) {
+    const bridgeCommandNames = new Set([
+      'start', 'stop', 'restart', 'resume', 'workdir', 'status',
+      'show', 'show_working', 'working', 'sessions', 'help',
+      'mcp', 'model', 'cost', 'usage', 'tools',
     ]);
-    const cmd = text.split(/\s+/)[0].toLowerCase();
-    if (bridgeCommands.has(cmd)) {
-      await handleCommand(roomId, text, sendReply, sendHtmlFn, sender);
+    const firstWord = text.split(/\s+/)[0].toLowerCase();
+    const cmdName = firstWord.slice(1); // strip ! or /
+    if (bridgeCommandNames.has(cmdName)) {
+      // Normalize to ! prefix for the handler
+      const normalizedText = '!' + text.slice(1);
+      await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
       return;
     }
     // Fall through — forward to Claude Code session
@@ -1891,6 +2082,7 @@ client.on('room.message', async (roomId, event) => {
       const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, prev.sessionId);
       newSession.originRoomId = prev.originRoomId || null;
       newSession.firstMessageCaptured = true;
+      newSession.chatHistory = prev.chatHistory || [];
       newSession.sendCallback = sendReply;
       newSession.sendHtml = sendHtmlFn;
       newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
@@ -1906,11 +2098,18 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
-  // Handle native button responses
-  if (event.content['chat.matron.button_response'] === true) {
+  // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
+  if (event.content['chat.matron.button_response']) {
     const relatesTo = event.content['m.relates_to'];
     const originalEventId = relatesTo?.event_id;
-    const value = (event.content.body || '').trim();
+    const responseData = event.content['chat.matron.button_response'];
+    const selectedValues = (typeof responseData === 'object' && Array.isArray(responseData.selected_values))
+      ? responseData.selected_values
+      : null;
+    // Use structured values if available, fall back to body
+    const value = selectedValues ? selectedValues.join(', ') : (event.content.body || '').trim();
+    // Override body-based text so the answer handler also uses structured values
+    if (selectedValues) text = value;
 
     // Check if this is a queue action response
     if (value === 'interrupt') {
@@ -1966,12 +2165,60 @@ client.on('room.message', async (roomId, event) => {
   }
 
   // Handle text "build" for plan approval
-  if (session.pendingPlan && text.toLowerCase().trim() === 'build') {
-    sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
-    session.pendingPlan = null;
+  console.log(`[PLAN-DEBUG] User message | text: "${text.slice(0, 50)}" | pendingPlan: ${!!session.pendingPlan} | busy: ${session.busy}`);
+  if (text.toLowerCase().trim() === 'build' && (session.pendingPlan || session.pendingPlanDenialId)) {
+    console.log(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${session.pendingPlanDenialId}`);
+    if (session.pendingPlanDenialId) {
+      // Send a tool_result to properly exit plan mode
+      const toolUseId = session.pendingPlanDenialId;
+      session.pendingPlan = null;
+      session.pendingPlanDenialId = null;
+      // Clear persisted denial ID
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+      }
+      session.busy = true;
+      const jsonMsg = JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              tool_use_id: toolUseId,
+              type: 'tool_result',
+              content: 'Plan approved by user.',
+            },
+            {
+              type: 'text',
+              text: 'Go ahead and execute the plan now.',
+            }
+          ]
+        }
+      }) + '\n';
+      console.log(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
+      session.proc.stdin.write(jsonMsg);
+      if (session.resetTimeout) session.resetTimeout();
+      if (session.typingInterval) clearInterval(session.typingInterval);
+      session.typingInterval = startTyping(session.roomId);
+    } else {
+      // Fallback: send as text
+      sendTextToSession(session, 'Go ahead and execute the plan now. Do not re-enter plan mode — just make the changes directly.');
+      session.pendingPlan = null;
+    }
     const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
     await sendHtmlFn(buildNotice.plain, buildNotice.html);
     return;
+  }
+
+  // User sent feedback on the plan (not "build") — clear plan state and forward as message.
+  // Only do this when Claude is idle; if busy, leave pendingPlan so "build" still works later.
+  if ((session.pendingPlan || session.pendingPlanDenialId) && !session.busy) {
+    session.pendingPlan = null;
+    session.pendingPlanDenialId = null;
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
+    }
+    // Falls through to normal message handling below
   }
 
   // Queue/interrupt logic when Claude is busy
@@ -2095,8 +2342,9 @@ client.on('room.message', async (roomId, event) => {
         await sendReply('Session is not available. Send !start to begin a new one.');
       } else if (!session.firstMessageCaptured) {
         session.firstMessageCaptured = true;
+        const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
         const fileName = event.content.body || 'file';
-        const label = `${SERVER_LABEL}: ${fileName.slice(0, 50)}`;
+        const label = `${SERVER_LABEL}:${sessionShort} ${fileName.slice(0, 30)}`;
         updateRoomName(session.roomId, label);
       }
     } catch (err) {
@@ -2106,14 +2354,76 @@ client.on('room.message', async (roomId, event) => {
   } else {
     if (!sendTextToSession(session, text)) {
       await sendReply('Session is not available. Send !start to begin a new one.');
-    } else if (!session.firstMessageCaptured) {
-      session.firstMessageCaptured = true;
-      const summary = text.length > 50 ? text.slice(0, 50) + '…' : text;
-      updateRoomName(session.roomId, `${SERVER_LABEL}: ${summary}`);
+    } else {
+      // Track user message for topic summarization (full text)
+      if (!session.chatHistory) session.chatHistory = [];
+      session.chatHistory.push({ role: 'user', text: text });
+      debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
+      // Persist chatHistory for resume across restarts
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+      }
+
+      if (!session.firstMessageCaptured) {
+        session.firstMessageCaptured = true;
+        const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+
+        // Generate initial 3-word name via Gemini
+        if (genAI) {
+          (async () => {
+            try {
+              const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
+              const result = await model.generateContent(
+                `Generate a 2-3 word noun phrase title for a conversation starting with this message. Use nouns, avoid verbs.\n\nMessage: ${text.slice(0, 500)}`
+              );
+              const title = result.response.text().trim().slice(0, 30);
+              updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${title}`);
+            } catch (e) {
+              // Fallback to first message if Gemini fails
+              const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
+              updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
+            }
+          })();
+        } else {
+          // No Gemini configured - use first message
+          const summary = text.length > 30 ? text.slice(0, 30) + '…' : text;
+          updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
+        }
+      }
     }
   }
   } catch (err) {
     console.error('[ERROR] room.message handler:', err);
+  }
+});
+
+// --- Room Membership Handler ---
+
+client.on('room.join', async (roomId, event) => {
+  try {
+    // Check if this is a user joining a session room
+    const session = sessions.get(roomId);
+    if (!session || !session.pendingWelcome) return;
+
+    // Check if the joining user is the invited user (not the bot)
+    if (event.sender === botUserId) return;
+
+    // Mark welcome as sent
+    session.pendingWelcome = false;
+
+    // Send welcome message now that user has joined
+    const workdir = session.workdir;
+    const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
+    const welcomeHtml =
+      `<b>Session started</b><br/>` +
+      `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
+      `<i>Send any message to interact with Claude Code.</i>`;
+
+    if (session.sendHtml) {
+      await session.sendHtml(welcomePlain, welcomeHtml);
+    }
+  } catch (err) {
+    console.error('[ERROR] room.join handler:', err);
   }
 });
 
@@ -2178,7 +2488,7 @@ const apiServer = createServer((req, res) => {
 
       // POST /ask — MCP server posts a question
       if (url.pathname === '/ask') {
-        const { question, header, options, roomId } = data;
+        const { question, header, options, multiSelect, roomId } = data;
         if (!question) {
           res.writeHead(400);
           res.end(JSON.stringify({ error: 'question is required' }));
@@ -2206,7 +2516,7 @@ const apiServer = createServer((req, res) => {
               question,
               header: header || null,
               options: options || [],
-              multiSelect: false,
+              multiSelect: multiSelect || false,
             }]
           };
 
@@ -2476,6 +2786,21 @@ async function main() {
 
   await client.start();
   console.log('Matrix client started, listening for messages...');
+
+  // Ensure all joined rooms have the chat.matron.commands state event
+  try {
+    const rooms = await client.getJoinedRooms();
+    for (const roomId of rooms) {
+      try {
+        await client.sendStateEvent(roomId, 'chat.matron.commands', '', { commands: MATRON_COMMANDS });
+      } catch (e) {
+        debug(`Could not set commands state in ${roomId}: ${e.message}`);
+      }
+    }
+    console.log(`Updated chat.matron.commands in ${rooms.length} rooms`);
+  } catch (e) {
+    console.error('Failed to update command state events:', e.message);
+  }
 }
 
 main().catch(err => {
