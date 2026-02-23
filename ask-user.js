@@ -143,5 +143,37 @@ server.tool(
   }
 );
 
+server.tool(
+  'redact_message',
+  'Redact (delete) a message that was sent by the bridge to the user in the Matrix chat. Use this to remove sensitive information that was accidentally posted. Note: Only messages sent by the bridge bot can be redacted.',
+  {
+    eventId: z.string().describe('The Matrix event ID of the message to redact'),
+    reason: z.string().optional().describe('Optional reason for redacting the message'),
+  },
+  async ({ eventId, reason }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/redact-message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, eventId, reason }),
+      });
+
+      if (!postRes.ok) {
+        const err = await postRes.text();
+        return { content: [{ type: 'text', text: `Error redacting message: ${err}` }] };
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Message ${eventId} has been redacted.${reason ? ` Reason: ${reason}` : ''}`
+        }]
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -141,7 +141,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
-    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.\nExitPlanMode is handled by the bridge — when you call it, the bridge will show the plan to the user and wait for their approval before continuing.',
+    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.\nExitPlanMode is handled by the bridge — when you call it, the bridge will show the plan to the user and wait for their approval before continuing.\n\nCRITICAL SECURITY REQUIREMENT - Sensitive Data Handling:\nNEVER post sensitive data (API keys, tokens, passwords, credentials, secrets, private keys, connection strings, etc.) directly in chat messages. You MUST use the mcp__ask-user__share_sensitive_data tool instead. This tool creates a secure one-time viewer link that:\n- Is only viewable once\n- Expires after a configurable time (default 1 hour)\n- Is NOT logged in conversation history\n- Cannot be accidentally exposed or copied from chat\n\nBefore posting ANY data that could be sensitive, ask yourself:\n1. Could this be used to authenticate or authorize access?\n2. Would exposure of this data create a security risk?\n3. Should this data be kept private?\n\nIf the answer to ANY of these is "yes", you MUST use mcp__ask-user__share_sensitive_data instead of posting in chat.\n\nExamples of data that MUST use share_sensitive_data:\n- API keys, access tokens, auth tokens\n- Passwords, passphrases, PINs\n- Private keys, certificates, secrets\n- Database connection strings with credentials\n- OAuth client secrets\n- Webhook secrets, signing keys\n- Any credential or secret value\n\nThis is a BLOCKING REQUIREMENT. Failure to use share_sensitive_data for sensitive data is a critical security violation.',
     '--include-partial-messages',
     '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify({
@@ -2715,6 +2715,26 @@ const apiServer = createServer((req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ url: link, expiresAt: new Date(expiresAt).toISOString() }));
+        return;
+      }
+
+      if (url.pathname === '/redact-message') {
+        const { roomId, eventId, reason } = data;
+        if (!roomId || !eventId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and eventId are required' }));
+          return;
+        }
+
+        try {
+          await client.redactEvent(roomId, eventId, reason || 'Message redacted by bridge');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          debug(`Failed to redact message: ${err.message}`);
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: `Failed to redact message: ${err.message}` }));
+        }
         return;
       }
 
