@@ -2972,17 +2972,24 @@ async function main() {
   await client.start();
   console.log('Matrix client started, listening for messages...');
 
-  // Ensure all joined rooms have the chat.matron.commands state event
+  // Ensure all joined rooms have the chat.matron.commands state event (only if changed)
   try {
     const rooms = await client.getJoinedRooms();
+    const newCommandsJson = JSON.stringify({ commands: MATRON_COMMANDS });
+    let updated = 0;
     for (const roomId of rooms) {
       try {
+        const existing = await client.getRoomStateEvent(roomId, 'chat.matron.commands', '');
+        if (JSON.stringify(existing) === newCommandsJson) continue;
+      } catch { /* state event doesn't exist yet */ }
+      try {
         await client.sendStateEvent(roomId, 'chat.matron.commands', '', { commands: MATRON_COMMANDS });
+        updated++;
       } catch (e) {
         debug(`Could not set commands state in ${roomId}: ${e.message}`);
       }
     }
-    console.log(`Updated chat.matron.commands in ${rooms.length} rooms`);
+    console.log(`Checked chat.matron.commands in ${rooms.length} rooms (updated ${updated})`);
   } catch (e) {
     console.error('Failed to update command state events:', e.message);
   }
