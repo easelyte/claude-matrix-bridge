@@ -2173,8 +2173,17 @@ client.on('room.message', async (roomId, event) => {
       const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
       await sendHtmlFn(arNotice.plain, arNotice.html);
     } else {
-      await sendReply('No active session. Send !start to begin.');
-      return;
+      // Auto-start a session in this room
+      const workdir = DEFAULT_WORKDIR;
+      const newSession = createSession(roomId, workdir);
+      newSession.sendCallback = sendReply;
+      newSession.sendHtml = sendHtmlFn;
+      session = newSession;
+
+      const autoNotice = notice('info',
+        `Session started.\nWorkdir: ${workdir}`,
+        `<b>Session started</b><br/>Workdir: <code>${escapeHtml(workdir)}</code>`);
+      await sendHtmlFn(autoNotice.plain, autoNotice.html);
     }
   }
 
