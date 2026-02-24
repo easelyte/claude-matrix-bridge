@@ -168,6 +168,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     env: {
       ...process.env,
       CLAUDECODE: '',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
       MATRIX_BRIDGE_API_PORT: String(API_PORT),
     },
@@ -1400,7 +1401,8 @@ function hasToolResultInHistory(sessionId, workdir, toolUseId) {
       if (!line) continue;
       // Quick string check before parsing JSON
       if (!line.includes(toolUseId)) continue;
-      const record = JSON.parse(line);
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
       if (record.type === 'user' && Array.isArray(record.message?.content)) {
         for (const block of record.message.content) {
           if (block.type === 'tool_result' && block.tool_use_id === toolUseId) {
@@ -2738,20 +2740,20 @@ const apiServer = createServer(async (req, res) => {
         const ttlSeconds = Math.min(Math.max(ttl || 3600, 60), 86400); // Min 1 min, max 24 hours, default 1 hour
         const expiresAt = Date.now() + ttlSeconds * 1000;
 
-        pendingSensitiveData.set(sensitiveId, {
-          label,
-          content,
-          viewed: false,
-          expiresAt,
-        });
-
-        // Generate secure link
+        // Generate secure link before storing data — if viewer is misconfigured, don't leak sensitive content in memory
         const link = generateSensitiveLink(sensitiveId, label, ttlSeconds);
         if (!link) {
           res.writeHead(500);
           res.end(JSON.stringify({ error: 'Viewer not configured (missing HMAC_SECRET or VIEWER_BASE_URL)' }));
           return;
         }
+
+        pendingSensitiveData.set(sensitiveId, {
+          label,
+          content,
+          viewed: false,
+          expiresAt,
+        });
 
         // Send notification to user in Matrix chat
         let activeSession = roomId ? sessions.get(roomId) : null;
