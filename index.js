@@ -1640,6 +1640,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         });
 
       let resumeSessionId;
+      let actualWorkdir = resumeWorkdir;
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
       if (!isNaN(num) && num >= 1 && num <= files.length) {
         resumeSessionId = files[num - 1];
@@ -1648,8 +1649,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         if (match) {
           resumeSessionId = match;
         } else {
-          await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
-          return;
+          // Session not found in current workdir — check persisted sessions for a different workdir
+          const allPersisted = loadPersistedSessions();
+          let foundEntry = null;
+          for (const entry of Object.values(allPersisted)) {
+            if (entry.sessionId && entry.sessionId.startsWith(resumeArg) && entry.workdir && entry.workdir !== resumeWorkdir) {
+              foundEntry = entry;
+              break;
+            }
+          }
+          if (foundEntry) {
+            const altEncoded = foundEntry.workdir.replace(/\//g, '-');
+            const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
+            const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
+            if (fs.existsSync(altFile)) {
+              resumeSessionId = foundEntry.sessionId;
+              actualWorkdir = foundEntry.workdir;
+            }
+          }
+          if (!resumeSessionId) {
+            await sendReply(`Session not found: ${resumeArg}\nUse !sessions to list available sessions.`);
+            return;
+          }
         }
       }
 
@@ -1673,7 +1694,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       const shortId = resumeSessionId.slice(0, 8);
-      const summary = getSessionSummary(resumeSessionId, resumeWorkdir);
+      const summary = getSessionSummary(resumeSessionId, actualWorkdir);
       const roomName = summary
         ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
         : `${SERVER_LABEL}: Resumed ${shortId}`;
@@ -1684,7 +1705,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, resumeWorkdir, resumeSessionId);
+      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId);
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
       session.sendCallback = sessionSendReply;
@@ -1692,14 +1713,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendButtonMessage = sessionSendButtons;
 
       // Persist immediately — we already know the session ID, don't wait for Claude's event
-      persistSession(sessionRoomId, resumeSessionId, resumeWorkdir, roomId);
+      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId);
 
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       await sendReply(`Resuming session ${shortId}… in new room: ${roomLink}`);
-      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${resumeWorkdir}\n\nSend any message to continue.`;
+      const resumePlain = `Resuming session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(resumeWorkdir)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(actualWorkdir)}</code><br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
