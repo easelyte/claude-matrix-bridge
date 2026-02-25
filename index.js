@@ -2434,8 +2434,7 @@ client.on('room.message', async (roomId, event) => {
         const transcriptionBlock = blocks.find(b => b.type === 'text' && b.text.startsWith('[Voice note transcription]'));
         if (transcriptionBlock) {
           const preview = transcriptionBlock.text.replace('[Voice note transcription]: ', '');
-          const truncated = preview.length > 100 ? preview.slice(0, 97) + '…' : preview;
-          const doneNotice = notice('success', `Transcribed: ${truncated}`, `Transcribed: ${escapeHtml(truncated)}`);
+          const doneNotice = notice('success', `Transcribed: ${preview}`, `Transcribed: ${escapeHtml(preview)}`);
           await editMessage(roomId, statusEventId, doneNotice.plain, doneNotice.html);
         }
       }
