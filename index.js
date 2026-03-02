@@ -99,15 +99,27 @@ function debug(...args) {
 
 const LAST_EVENT_TS_FILE = path.join(os.homedir(), '.claude-matrix-bot-last-event-ts');
 
-function loadLastEventTs() {
-  try { return parseInt(fs.readFileSync(LAST_EVENT_TS_FILE, 'utf-8'), 10) || 0; } catch { return 0; }
+function loadLastEventTsMap() {
+  try {
+    const raw = fs.readFileSync(LAST_EVENT_TS_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    // Migrate from old single-number format
+    if (typeof parsed === 'number') return {};
+    return parsed || {};
+  } catch { return {}; }
 }
 
-function saveLastEventTs(ts) {
-  try { fs.writeFileSync(LAST_EVENT_TS_FILE, String(ts)); } catch {}
+let lastEventTsMap = loadLastEventTsMap();
+let lastEventTsDirty = false;
+
+function saveLastEventTsMap() {
+  if (!lastEventTsDirty) return;
+  try { fs.writeFileSync(LAST_EVENT_TS_FILE, JSON.stringify(lastEventTsMap)); } catch {}
+  lastEventTsDirty = false;
 }
 
-let lastEventTs = loadLastEventTs();
+// Flush per-room timestamps periodically rather than on every event
+setInterval(saveLastEventTsMap, 5000);
 
 function loadPersistedSessions() {
   try {
@@ -2121,15 +2133,16 @@ client.on('room.message', async (roomId, event) => {
   if (!event.content?.msgtype) return;
   if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
-  // Skip events we already processed before a restart. Events sent during
-  // downtime have a newer timestamp and will be processed normally.
+  // Skip events we already processed before a restart (per-room tracking).
+  // Events sent during downtime have a newer timestamp and will be processed normally.
   const eventTs = event.origin_server_ts || 0;
-  if (eventTs <= lastEventTs) {
-    debug(`Skipping already-processed event in ${roomId} (ts: ${eventTs}, last: ${lastEventTs})`);
+  const roomLastTs = lastEventTsMap[roomId] || 0;
+  if (eventTs <= roomLastTs) {
+    debug(`Skipping already-processed event in ${roomId} (ts: ${eventTs}, last: ${roomLastTs})`);
     return;
   }
-  lastEventTs = eventTs;
-  saveLastEventTs(lastEventTs);
+  lastEventTsMap[roomId] = eventTs;
+  lastEventTsDirty = true;
 
   const sender = event.sender;
   if (!isAllowed(sender)) return;
@@ -3033,6 +3046,7 @@ main().catch(err => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
+  saveLastEventTsMap();
   for (const [, session] of sessions) {
     if (session.alive) session.proc.kill();
   }
@@ -3041,6 +3055,7 @@ process.on('SIGINT', () => {
 });
 
 process.on('SIGTERM', () => {
+  saveLastEventTsMap();
   for (const [, session] of sessions) {
     if (session.alive) session.proc.kill();
   }
