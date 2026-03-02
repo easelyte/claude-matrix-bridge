@@ -1324,9 +1324,15 @@ async function maybeUpdatePinnedSummary(session) {
       const htmlText = `<b>📌 Session Summary</b><br/><br/>${escapeHtml(updatedSummary).replace(/\n/g, '<br/>')}`;
 
       if (session.pinnedSummaryEventId) {
-        // Edit existing pinned message
-        await editMessage(session.roomId, session.pinnedSummaryEventId, plainText, htmlText);
-      } else {
+        // Verify pinned message still exists; reset if deleted so next block creates a new one
+        try {
+          await client.getEvent(session.roomId, session.pinnedSummaryEventId);
+          await editMessage(session.roomId, session.pinnedSummaryEventId, plainText, htmlText);
+        } catch {
+          session.pinnedSummaryEventId = null;
+        }
+      }
+      if (!session.pinnedSummaryEventId) {
         // Create new pinned message
         const eventId = await client.sendMessage(session.roomId, {
           msgtype: 'm.text',
