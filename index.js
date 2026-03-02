@@ -2110,14 +2110,6 @@ client.on('room.message', async (roomId, event) => {
   if (!event.content?.msgtype) return;
   if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
-  // Skip events replayed during initial sync — they were already handled
-  // before the restart and would otherwise trigger duplicate sessions.
-  // Events arriving after client.start() resolves are genuinely new.
-  if (!initialSyncDone) {
-    debug(`Skipping initial-sync event in ${roomId} from ${event.sender}`);
-    return;
-  }
-
   const sender = event.sender;
   if (!isAllowed(sender)) return;
 
@@ -2151,6 +2143,12 @@ client.on('room.message', async (roomId, event) => {
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
     if (bridgeCommandNames.has(cmdName)) {
+      // Skip commands replayed during initial sync — they were already handled
+      // before the restart and would otherwise trigger duplicate sessions.
+      if (!initialSyncDone) {
+        debug(`Skipping initial-sync command ${cmdName} in ${roomId} from ${sender}`);
+        return;
+      }
       // Normalize to ! prefix for the handler
       const normalizedText = '!' + text.slice(1);
       await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
