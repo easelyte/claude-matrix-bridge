@@ -734,8 +734,14 @@ function handleClaudeEvent(session, event) {
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
         const queued = session.queuedMessages;
         session.queuedMessages = null;
-        if (session.sendCallback) {
-          session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}...`);
+        if (session.sendHtml) {
+          const summary = formatQueueSummary(queued);
+          const plainMsg = `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`;
+          const htmlMsg = `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`;
+          session.sendHtml(plainMsg, htmlMsg);
+        } else if (session.sendCallback) {
+          const summary = formatQueueSummary(queued);
+          session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
         }
         flushQueue(session, queued);
       }
@@ -875,6 +881,27 @@ function sendToSession(session, contentBlocks) {
 
 function sendTextToSession(session, text) {
   return sendToSession(session, [{ type: 'text', text }]);
+}
+
+function formatQueueSummary(queued) {
+  const lines = [];
+  for (let i = 0; i < queued.length; i++) {
+    const blocks = queued[i];
+    const isTextOnly = blocks.every(b => b.type === 'text');
+    if (isTextOnly) {
+      const text = blocks.map(b => b.text).join('\n');
+      const preview = text.length > 200 ? text.slice(0, 197) + '…' : text;
+      lines.push({ index: i + 1, text: preview });
+    } else {
+      const types = blocks.map(b => b.type === 'image' ? 'image' : b.type === 'audio' ? 'audio' : 'file');
+      lines.push({ index: i + 1, text: `[${types.join(', ')}]` });
+    }
+  }
+  const plain = lines.map(l => `  ${l.index}. ${l.text}`).join('\n');
+  const html = lines.map(l =>
+    `<li>${escapeHtml(l.text)}</li>`
+  ).join('');
+  return { plain, html: `<ol>${html}</ol>` };
 }
 
 function flushQueue(session, queued) {
@@ -2206,8 +2233,13 @@ client.on('room.message', async (roomId, event) => {
       session.queuedMessages = null;
       stripQueueNotificationLinks(session);
       if (queued.length > 0) {
-        if (session.sendCallback) {
-          session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
+        const summary = formatQueueSummary(queued);
+        if (session.sendHtml) {
+          const plainMsg = `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
+          const htmlMsg = `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
+          session.sendHtml(plainMsg, htmlMsg);
+        } else if (session.sendCallback) {
+          session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
         }
         flushQueue(session, queued);
       }
@@ -2331,7 +2363,14 @@ client.on('room.message', async (roomId, event) => {
       session.queuedMessages = null;
       stripQueueNotificationLinks(session);
       if (queued.length > 0) {
-        await sendReply(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
+        const summary = formatQueueSummary(queued);
+        if (sendHtmlFn) {
+          const plainMsg = `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
+          const htmlMsg = `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
+          await sendHtmlFn(plainMsg, htmlMsg);
+        } else {
+          await sendReply(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
+        }
         flushQueue(session, queued);
       } else {
         await sendReply('⚡ No queued messages to send.');
@@ -2848,8 +2887,13 @@ const apiServer = createServer(async (req, res) => {
         session.queuedMessages = null;
         stripQueueNotificationLinks(session);
         if (queued.length > 0) {
-          if (session.sendCallback) {
-            session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now...`);
+          const summary = formatQueueSummary(queued);
+          if (session.sendHtml) {
+            const plainMsg = `⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`;
+            const htmlMsg = `<b>⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:</b>${summary.html}`;
+            session.sendHtml(plainMsg, htmlMsg);
+          } else if (session.sendCallback) {
+            session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
           }
           flushQueue(session, queued);
         }
