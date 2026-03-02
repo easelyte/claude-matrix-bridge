@@ -103,6 +103,33 @@ function debug(...args) {
 
 // --- Session Persistence ---
 
+const LAST_EVENT_TS_FILE = path.join(os.homedir(), '.claude-matrix-bot-last-event-ts');
+
+function loadLastEventTsMap() {
+  try {
+    const raw = fs.readFileSync(LAST_EVENT_TS_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    // Migrate from old single-number format
+    if (typeof parsed === 'number') return {};
+    return parsed || {};
+  } catch { return {}; }
+}
+
+let lastEventTsMap = loadLastEventTsMap();
+let lastEventTsDirty = false;
+const botStartupTs = Date.now();
+
+function saveLastEventTsMap() {
+  if (!lastEventTsDirty) return;
+  try {
+    fs.writeFileSync(LAST_EVENT_TS_FILE, JSON.stringify(lastEventTsMap));
+    lastEventTsDirty = false;
+  } catch {}
+}
+
+// Flush per-room timestamps periodically rather than on every event
+setInterval(saveLastEventTsMap, 5000);
+
 function loadPersistedSessions() {
   try {
     if (fs.existsSync(SESSIONS_FILE)) {
@@ -2151,6 +2178,21 @@ client.on('room.message', async (roomId, event) => {
   if (!event.content?.msgtype) return;
   if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
+  // Skip events we already processed before a restart (per-room tracking).
+  // Only apply dedup for events that predate bot startup — these are sync replays.
+  // Events newer than startup can't be replays and are always processed, even if
+  // federated clock skew makes their timestamp slightly out of order.
+  const eventTs = event.origin_server_ts || 0;
+  const roomLastTs = lastEventTsMap[roomId] || 0;
+  if (eventTs < botStartupTs && eventTs <= roomLastTs) {
+    debug(`Skipping already-processed event in ${roomId} (ts: ${eventTs}, last: ${roomLastTs})`);
+    return;
+  }
+  if (eventTs > roomLastTs) {
+    lastEventTsMap[roomId] = eventTs;
+    lastEventTsDirty = true;
+  }
+
   const sender = event.sender;
   if (!isAllowed(sender)) return;
 
@@ -3072,6 +3114,7 @@ main().catch(err => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
+  saveLastEventTsMap();
   for (const [, session] of sessions) {
     if (session.alive) session.proc.kill();
   }
@@ -3080,6 +3123,7 @@ process.on('SIGINT', () => {
 });
 
 process.on('SIGTERM', () => {
+  saveLastEventTsMap();
   for (const [, session] of sessions) {
     if (session.alive) session.proc.kill();
   }
