@@ -97,6 +97,18 @@ function debug(...args) {
 
 // --- Session Persistence ---
 
+const LAST_EVENT_TS_FILE = path.join(os.homedir(), '.claude-matrix-bot-last-event-ts');
+
+function loadLastEventTs() {
+  try { return parseInt(fs.readFileSync(LAST_EVENT_TS_FILE, 'utf-8'), 10) || 0; } catch { return 0; }
+}
+
+function saveLastEventTs(ts) {
+  try { fs.writeFileSync(LAST_EVENT_TS_FILE, String(ts)); } catch {}
+}
+
+let lastEventTs = loadLastEventTs();
+
 function loadPersistedSessions() {
   try {
     if (fs.existsSync(SESSIONS_FILE)) {
@@ -1132,7 +1144,6 @@ const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, stor
 AutojoinRoomsMixin.setupOnClient(client);
 
 let botUserId;
-let initialSyncDone = false; // set true after client.start() resolves; events before that are replays
 
 // --- Send to Matrix Room ---
 
@@ -2110,10 +2121,15 @@ client.on('room.message', async (roomId, event) => {
   if (!event.content?.msgtype) return;
   if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
-  // Skip all events from the initial sync — processing them would replay
-  // old commands (creating duplicate sessions) and send replies into rooms
-  // (bumping them to the top of the user's room list).
-  if (!initialSyncDone) return;
+  // Skip events we already processed before a restart. Events sent during
+  // downtime have a newer timestamp and will be processed normally.
+  const eventTs = event.origin_server_ts || 0;
+  if (eventTs <= lastEventTs) {
+    debug(`Skipping already-processed event in ${roomId} (ts: ${eventTs}, last: ${lastEventTs})`);
+    return;
+  }
+  lastEventTs = eventTs;
+  saveLastEventTs(lastEventTs);
 
   const sender = event.sender;
   if (!isAllowed(sender)) return;
@@ -2984,7 +3000,6 @@ async function main() {
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
 
   await client.start();
-  initialSyncDone = true;
   console.log('Matrix client started, listening for messages...');
 
   // Ensure all joined rooms have the chat.matron.commands state event (only if changed)
