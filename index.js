@@ -1132,7 +1132,7 @@ const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, stor
 AutojoinRoomsMixin.setupOnClient(client);
 
 let botUserId;
-const botStartupTs = Date.now(); // used to skip events replayed during initial sync
+let initialSyncDone = false; // set true after client.start() resolves; events before that are replays
 
 // --- Send to Matrix Room ---
 
@@ -2110,11 +2110,11 @@ client.on('room.message', async (roomId, event) => {
   if (!event.content?.msgtype) return;
   if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
-  // Skip events that predate the bot's startup — they were already handled
-  // before the restart and would otherwise trigger duplicate sessions
-  const eventTs = event.origin_server_ts || 0;
-  if (eventTs < botStartupTs) {
-    debug(`Skipping pre-startup event in ${roomId} (event: ${eventTs}, startup: ${botStartupTs})`);
+  // Skip events replayed during initial sync — they were already handled
+  // before the restart and would otherwise trigger duplicate sessions.
+  // Events arriving after client.start() resolves are genuinely new.
+  if (!initialSyncDone) {
+    debug(`Skipping initial-sync event in ${roomId} from ${event.sender}`);
     return;
   }
 
@@ -2987,6 +2987,7 @@ async function main() {
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
 
   await client.start();
+  initialSyncDone = true;
   console.log('Matrix client started, listening for messages...');
 
   // Ensure all joined rooms have the chat.matron.commands state event (only if changed)
