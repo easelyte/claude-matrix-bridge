@@ -1280,6 +1280,8 @@ async function maybeUpdatePinnedSummary(session) {
       const compactResult = await model.generateContent(compactPrompt);
       currentSummary = compactResult.response.text().trim();
       bulletCount = (currentSummary.match(/^•/gm) || []).length;
+      // Persist compacted result immediately so it isn't lost if the next LLM call fails to match
+      session.pinnedSummaryText = currentSummary;
     }
 
     // Get last 50 messages for summarization (broad context for better titles)
@@ -1309,8 +1311,12 @@ async function maybeUpdatePinnedSummary(session) {
     let updatedSummary = '';
     if (newMatch && currentSummary) {
       updatedSummary = `${currentSummary}\n• ${newMatch[1].trim()}`;
-    } else if (summaryMatch) {
+    } else if (summaryMatch && !currentSummary) {
+      // Only use SUMMARY: for the initial summary, not after compaction
       updatedSummary = `• ${summaryMatch[1].trim()}`;
+    } else if (currentSummary) {
+      // LLM didn't produce a match — keep the existing summary (e.g. after compaction)
+      updatedSummary = currentSummary;
     }
 
     if (updatedSummary) {
