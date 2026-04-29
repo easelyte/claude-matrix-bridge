@@ -8,14 +8,17 @@
  * Credentials are written to a file on disk (not printed to stdout).
  *
  * Usage:
- *   node setup-user.mjs <username> [--bot @bot1:host --bot @bot2:host]
+ *   node setup-user.mjs <username> [options]
+ *
+ * Options:
+ *   --bot @bot:host           Cross-sign this bot from the user side. Repeatable.
+ *   --password <pw>           Use this password for the user (default: random hex).
+ *   --credentials-file <path> Where to write the credentials file
+ *                             (default: ~/.matrix-user-<username>-credentials).
  *
  * Environment:
  *   MATRIX_HOMESERVER_URL  — Homeserver URL (default: from .env)
  *   REG_TOKEN              — Registration token (required if registration is token-gated)
- *
- * Output:
- *   Writes credentials to ~/.matrix-user-<username>-credentials
  */
 
 import dotenv from 'dotenv';
@@ -41,17 +44,23 @@ function log(...a) { origLog(...a); }
 function parseArgs() {
     const args = process.argv.slice(2);
     if (!args.length || args[0].startsWith('-')) {
-        console.error('Usage: node setup-user.mjs <username> [--bot @user:host ...]');
+        console.error('Usage: node setup-user.mjs <username> [--bot @user:host ...] [--password <pw>] [--credentials-file <path>]');
         process.exit(1);
     }
     const username = args[0];
     const bots = [];
+    let password = null;
+    let credentialsFile = null;
     for (let i = 1; i < args.length; i++) {
         if (args[i] === '--bot' && args[i + 1]) {
             bots.push(args[++i]);
+        } else if (args[i] === '--password' && args[i + 1]) {
+            password = args[++i];
+        } else if (args[i] === '--credentials-file' && args[i + 1]) {
+            credentialsFile = args[++i];
         }
     }
-    return { username, bots };
+    return { username, bots, password, credentialsFile };
 }
 
 async function register(username, password) {
@@ -82,8 +91,8 @@ async function register(username, password) {
 }
 
 async function main() {
-    const { username, bots } = parseArgs();
-    const password = crypto.randomBytes(16).toString('hex');
+    const { username, bots, password: cliPassword, credentialsFile: cliCredentialsFile } = parseArgs();
+    const password = cliPassword || crypto.randomBytes(16).toString('hex');
 
     // Derive hostname from homeserver
     const whoamiUrl = `${HOMESERVER}/_matrix/client/versions`;
@@ -212,13 +221,15 @@ async function main() {
         body: '{}',
     });
 
-    // Write credentials to file
-    const credsFile = path.join(os.homedir(), `.matrix-user-${username}-credentials`);
+    // Write credentials to file. Shell-quote so the file is safe to `source`
+    // from bash (matrix-user-setup.sh reads recovery_key + password back out).
+    const credsFile = cliCredentialsFile || path.join(os.homedir(), `.matrix-user-${username}-credentials`);
+    const sq = (v) => `'${String(v).replace(/'/g, "'\\''")}'`;
     const creds = [
-        `user_id=${regResult.user_id}`,
-        `password=${password}`,
-        `recovery_key=${recoveryKey}`,
-        `homeserver=${HOMESERVER}`,
+        `user_id=${sq(regResult.user_id)}`,
+        `password=${sq(password)}`,
+        `recovery_key=${sq(recoveryKey)}`,
+        `homeserver=${sq(HOMESERVER)}`,
     ].join('\n') + '\n';
     fs.writeFileSync(credsFile, creds, { mode: 0o600 });
 
