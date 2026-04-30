@@ -32,7 +32,6 @@ import os from 'os';
 // Suppress noisy debug/info output from Rust SDK and matrix-js-sdk internals
 const origWarn = console.warn;
 const origLog = console.log;
-const origDebug = console.debug;
 const suppressed = /matrix_sdk_crypto|FetchHttpApi|key backup|push rule|Olm|crypto-sdk|CryptoStore|outgoing request|^\[Perf\]|receiveSyncChanges|Sync|saved sync|queued to-device|client options|Getting|Got |Prepare|Sending|Storing|Resuming|Attempting|Fetched|Adding default|cross signing identity|resetCrossSigning|bootstrapCrossSigning:|Secret storage|^INFO /;
 console.warn = (...a) => { if (!suppressed.test(String(a[0]))) origWarn(...a); };
 console.log = (...a) => { if (!suppressed.test(String(a[0]))) origLog(...a); };

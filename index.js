@@ -255,7 +255,7 @@ function createSession(roomId, workdir, resumeSessionId) {
       let event;
       try {
         event = JSON.parse(trimmed);
-      } catch (e) {
+      } catch (_e) {
         debug('Failed to parse JSON line:', trimmed);
         continue;
       }
@@ -1941,7 +1941,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }).join('\n');
 
       // HTML formatted version
-      const htmlRows = items.map((s, i) => {
+      const htmlRows = items.map((s) => {
         const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
         const shortId = s.sessionId.slice(0, 8);
         const active = s.sessionId === activeId ? ' ⚡' : '';
@@ -2275,8 +2275,6 @@ client.on('room.message', async (roomId, event) => {
 
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
   if (event.content['chat.matron.button_response']) {
-    const relatesTo = event.content['m.relates_to'];
-    const originalEventId = relatesTo?.event_id;
     const responseData = event.content['chat.matron.button_response'];
     const selectedValues = (typeof responseData === 'object' && Array.isArray(responseData.selected_values))
       ? responseData.selected_values
@@ -2577,7 +2575,7 @@ client.on('room.message', async (roomId, event) => {
               );
               const title = result.response.text().trim().slice(0, 60);
               updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${title}`);
-            } catch (e) {
+            } catch (_e) {
               // Fallback to first message if Gemini fails
               const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
               updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${summary}`);
@@ -3053,7 +3051,7 @@ const apiServer = createServer(async (req, res) => {
         res.writeHead(404);
         res.end('Not found');
       }
-    } catch (e) {
+    } catch (_e) {
       res.writeHead(400);
       res.end(JSON.stringify({ error: 'Invalid JSON' }));
     }

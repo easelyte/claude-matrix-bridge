@@ -10,20 +10,35 @@
   "scripts": {
     "start": "node index.js",
     "test": "vitest run",
-    "bootstrap-crosssigning": "node bootstrap-crosssigning.mjs"
+    "bootstrap-crosssigning": "node bootstrap-crosssigning.mjs",
+    "lint": "eslint . --max-warnings=0",
+    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check setup-user.mjs && node --check verify-bots.mjs && node --check bootstrap-crosssigning.mjs && node --check lib/transcribe.js",
+    "audit:high": "npm audit --audit-level=high",
+    "ci": "npm run lint && npm run check && npm test && npm run audit:high"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "@google/generative-ai": "^0.24.1",
-    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
-    "matrix-bot-sdk": "^0.7.0",
-    "matrix-js-sdk": "^34.0.0",
-    "zod": "^4.3.6"
+    "matrix-bot-sdk": "^0.8.0",
+    "matrix-js-sdk": "^41.4.0",
+    "zod": "^4.4.1"
   },
   "devDependencies": {
-    "vitest": "^4.0.18"
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.2.1",
+    "globals": "^17.5.0",
+    "vitest": "^4.1.5"
   },
-  "license": "AGPL-3.0-only"
+  "license": "AGPL-3.0-only",
+  "overrides": {
+    "form-data": "^2.5.5",
+    "qs": "^6.14.1",
+    "tough-cookie": "^4.1.4",
+    "matrix-js-sdk": {
+      "uuid": "^14.0.0"
+    }
+  }
 }

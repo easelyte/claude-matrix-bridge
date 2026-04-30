@@ -94,12 +94,6 @@ async function main() {
     const { username, bots, password: cliPassword, credentialsFile: cliCredentialsFile } = parseArgs();
     const password = cliPassword || crypto.randomBytes(16).toString('hex');
 
-    // Derive hostname from homeserver
-    const whoamiUrl = `${HOMESERVER}/_matrix/client/versions`;
-    const hostname = new URL(HOMESERVER).hostname === 'localhost'
-        ? (process.env.MATRIX_HOSTNAME || HOMESERVER.replace(/https?:\/\//, '').replace(/:\d+$/, ''))
-        : new URL(HOMESERVER).hostname;
-
     log(`Setting up user @${username} on ${HOMESERVER}`);
     if (bots.length) log(`Will cross-sign: ${bots.join(', ')}`);
 
