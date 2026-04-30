@@ -3,12 +3,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-SERVICE_USER="${SERVICE_USER:-alice}"
+SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
+SERVICE_HOME="${SERVICE_HOME:-$(getent passwd "$SERVICE_USER" | cut -d: -f6)}"
 NODE_BIN="${NODE_BIN:-$(which node)}"
+
+if [ -z "$SERVICE_HOME" ]; then
+  echo "Could not determine home directory for SERVICE_USER=$SERVICE_USER" >&2
+  exit 1
+fi
 
 echo "=== Installing systemd services ==="
 echo "Repo: $REPO_DIR"
 echo "User: $SERVICE_USER"
+echo "Home: $SERVICE_HOME"
 echo "Node: $NODE_BIN"
 echo
 
@@ -26,7 +33,7 @@ EnvironmentFile=$REPO_DIR/.env
 ExecStart=$NODE_BIN $REPO_DIR/index.js
 Restart=always
 RestartSec=5
-Environment=PATH=/home/$SERVICE_USER/.local/bin:/home/$SERVICE_USER/.claude/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$SERVICE_HOME/.local/bin:$SERVICE_HOME/.claude/bin:/usr/local/bin:/usr/bin:/bin
 Environment=ELECTRON_RUN_AS_NODE=
 
 [Install]

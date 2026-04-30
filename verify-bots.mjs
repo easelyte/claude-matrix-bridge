@@ -7,8 +7,8 @@
  *
  * Usage:
  *   node verify-bots.mjs --recovery-key-file ~/.matrix-recovery-key \
- *     --user @alice:host --password <pass> \
- *     --bot @dev-2:host --bot @dev-3:host
+ *     --user @alice:matron.chat --password <pass> \
+ *     --bot @dev-2:matron.chat --bot @dev-3:matron.chat
  *
  * Environment (used as defaults):
  *   MATRIX_HOMESERVER_URL  — Homeserver URL (default: from .env)
