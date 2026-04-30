@@ -26,7 +26,7 @@ const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .map(id => id.trim())
   .filter(Boolean);
 
-const DEFAULT_WORKDIR = process.env.DEFAULT_WORKDIR || process.cwd();
+const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || process.cwd()));
 const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';

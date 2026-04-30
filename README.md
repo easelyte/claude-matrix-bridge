@@ -28,7 +28,7 @@ npm start
 | `MATRIX_HOMESERVER_URL` | Matrix homeserver URL (required) | `http://localhost:6167` |
 | `MATRIX_ACCESS_TOKEN` | Bot account access token (required) | — |
 | `ALLOWED_USER_IDS` | Comma-separated Matrix user IDs (e.g. `@alice:matron.chat`) | `""` (any user) |
-| `DEFAULT_WORKDIR` | Default working directory for Claude Code sessions | `process.cwd()` |
+| `DEFAULT_WORKDIR` | Default working directory for Claude Code sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `SESSION_TIMEOUT` | Session timeout in ms | `3600000` (1 hour) |
 | `DEBUG` | Set to `1` to log raw JSON events from Claude Code | `0` |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
