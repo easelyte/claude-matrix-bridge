@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-SERVICE_USER="${SERVICE_USER:-danbarker}"
+SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$(whoami)}}"
 NODE_BIN="${NODE_BIN:-$(which node)}"
 
 echo "=== Installing systemd services ==="

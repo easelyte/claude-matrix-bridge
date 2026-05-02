@@ -33,13 +33,17 @@ let truncated = false;
 
 function pipe(source, sink) {
   source.on('data', chunk => {
-    if (truncated) return;
+    if (truncated) {
+      sink.write(chunk);
+      return;
+    }
     if (bytesWritten + chunk.length > MAX_BYTES) {
       const remaining = MAX_BYTES - bytesWritten;
       if (remaining > 0) log.write(chunk.subarray(0, remaining));
       log.write(`\n[matron-tee: output truncated at ${MAX_BYTES} bytes]\n`);
       truncated = true;
       bytesWritten = MAX_BYTES;
+      sink.write(chunk);
       return;
     }
     bytesWritten += chunk.length;

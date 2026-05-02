@@ -191,7 +191,7 @@ function getPersistedSession(roomId) {
 const sessions = new Map(); // roomId -> session
 
 function createSession(roomId, workdir, resumeSessionId) {
-  const cwd = workdir || DEFAULT_WORKDIR;
+  const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
   // showBashOutput is persisted via persistSession on toggle and re-read here at
   // spawn so the hook env stays in sync with the room's setting across restarts.

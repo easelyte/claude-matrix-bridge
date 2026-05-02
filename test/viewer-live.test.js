@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import path from 'node:path';
 
 let server, port;
 beforeAll(async () => {
@@ -45,7 +46,7 @@ describe('GET /live', () => {
     const fs = await import('node:fs');
     const bundlePath = process.env.MATRON_PLUGIN_DIR
       ? `${process.env.MATRON_PLUGIN_DIR}/live-output.mjs`
-      : '/home/danbarker/matronhq/matron-web/packages/matron-live-output/dist/live-output.mjs';
+      : path.join(process.cwd(), 'plugins', 'live-output.mjs');
     if (!fs.existsSync(bundlePath)) {
       console.log('skip: plugin bundle not present at', bundlePath);
       return;

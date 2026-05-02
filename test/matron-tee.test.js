@@ -53,10 +53,11 @@ describe('matron-tee', () => {
   it('truncates output past MATRON_LIVE_OUTPUT_MAX_BYTES', async () => {
     const log = path.join(tmp, 'out.log');
     // Cap at 1KB; produce 5KB of output
-    await run(TEE, [log, '--', 'sh', '-c', 'yes x | head -c 5000'], {
+    const { stdout } = await run(TEE, [log, '--', 'sh', '-c', 'yes x | head -c 5000'], {
       env: { ...process.env, MATRON_LIVE_OUTPUT_MAX_BYTES: '1024' }
     });
     const content = readFileSync(log, 'utf-8');
+    expect(stdout.length).toBe(5000);
     expect(content).toContain('[matron-tee: output truncated at 1024 bytes]');
     const sentinelIdx = content.indexOf('[matron-tee: output truncated');
     // Sentinel is preceded by at most MAX_BYTES of payload plus a single delimiting '\n'.
