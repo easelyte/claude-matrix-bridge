@@ -2785,31 +2785,45 @@ client.on('room.message', async (roomId, event) => {
 
 // --- Room Membership Handler ---
 
+async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
+  const session = sessions.get(roomId);
+  if (!session || !session.pendingWelcome) return;
+  if (joinedUserId === botUserId) return;
+
+  // Mark as sent before sending to avoid duplicate notices if both room.join
+  // and the membership state event arrive.
+  session.pendingWelcome = false;
+
+  // Let the crypto room tracker process the join before sharing the room key.
+  await new Promise(r => setTimeout(r, 500));
+
+  const workdir = session.workdir;
+  const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
+  const welcomeHtml =
+    `<b>Session started</b><br/>` +
+    `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
+    `<i>Send any message to interact with Claude Code.</i>`;
+
+  if (session.sendHtml) {
+    await session.sendHtml(welcomePlain, welcomeHtml);
+  }
+}
+
 client.on('room.join', async (roomId, event) => {
   try {
-    // Check if this is a user joining a session room
-    const session = sessions.get(roomId);
-    if (!session || !session.pendingWelcome) return;
-
-    // Check if the joining user is the invited user (not the bot)
-    if (event.sender === botUserId) return;
-
-    // Mark welcome as sent
-    session.pendingWelcome = false;
-
-    // Send welcome message now that user has joined
-    const workdir = session.workdir;
-    const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
-    const welcomeHtml =
-      `<b>Session started</b><br/>` +
-      `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
-      `<i>Send any message to interact with Claude Code.</i>`;
-
-    if (session.sendHtml) {
-      await session.sendHtml(welcomePlain, welcomeHtml);
-    }
+    await sendPendingWelcomeIfNeeded(roomId, event.state_key || event.sender);
   } catch (err) {
     console.error('[ERROR] room.join handler:', err);
+  }
+});
+
+client.on('room.event', async (roomId, event) => {
+  try {
+    if (event.type !== 'm.room.member') return;
+    if (event.content?.membership !== 'join') return;
+    await sendPendingWelcomeIfNeeded(roomId, event.state_key || event.sender);
+  } catch (err) {
+    console.error('[ERROR] room.event membership handler:', err);
   }
 });
 
