@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { MatrixClient, SimpleFsStorageProvider, AutojoinRoomsMixin, RustSdkCryptoStorageProvider } from 'matrix-bot-sdk';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
@@ -11,25 +11,27 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
+import { generateSignedUrl } from './viewer/server.js';
+
+const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
+const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
 
 // --- Config ---
 
 const MATRIX_HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL || 'http://localhost:6167';
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN;
-if (!MATRIX_ACCESS_TOKEN) {
-  console.error('MATRIX_ACCESS_TOKEN is required in .env');
-  process.exit(1);
-}
 
 const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .split(',')
   .map(id => id.trim())
   .filter(Boolean);
 
-const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || process.cwd()));
+const DEFAULT_WORKDIR = process.env.DEFAULT_WORKDIR || process.cwd();
 const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
+const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON)
@@ -52,10 +54,33 @@ const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
+const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 
 // Gemini client for room topic summarization
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+
+function loadBridgeSystemPrompt() {
+  try {
+    return fs.readFileSync(BRIDGE_CLAUDE_MD_PATH, 'utf-8').trim();
+  } catch (e) {
+    console.warn(`Could not read bridge Claude instructions from ${BRIDGE_CLAUDE_MD_PATH}: ${e.message}`);
+    return FALLBACK_BRIDGE_PROMPT;
+  }
+}
+
+const BRIDGE_SYSTEM_PROMPT = loadBridgeSystemPrompt();
+
+// Live-bash-output store (per-process). Tracks active matron-tee'd Bash commands
+// so that tool_result events can write the corresponding .done sentinel.
+const _rawLiveOutputTtl = parseInt(process.env.MATRON_LIVE_OUTPUT_TTL || '14400', 10);
+const LIVE_OUTPUT_TTL = Number.isFinite(_rawLiveOutputTtl) && _rawLiveOutputTtl > 0 ? _rawLiveOutputTtl : 14400;
+const liveOutputStore = createLiveOutputStore({ ttlSeconds: LIVE_OUTPUT_TTL });
+sweepOrphanedLogs('/tmp', LIVE_OUTPUT_TTL);
+setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
+if (!HMAC_SECRET || !VIEWER_BASE_URL) {
+  console.warn('[live-output] HMAC_SECRET or VIEWER_BASE_URL unset — live-output tiles disabled');
+}
 
 function expandHome(p) {
   if (p === '~') return os.homedir();
@@ -167,6 +192,12 @@ const sessions = new Map(); // roomId -> session
 
 function createSession(roomId, workdir, resumeSessionId) {
   const cwd = workdir || DEFAULT_WORKDIR;
+  // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
+  // showBashOutput is persisted via persistSession on toggle and re-read here at
+  // spawn so the hook env stays in sync with the room's setting across restarts.
+  // Unset (undefined) means "never toggled" → use the default (on).
+  const persistedForRoom = getPersistedSession(roomId);
+  const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
   const args = [
     '--print',
     '--verbose',
@@ -174,7 +205,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
-    '--append-system-prompt', 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.\nExitPlanMode is handled by the bridge — when you call it, the bridge will show the plan to the user and wait for their approval before continuing.\n\nCRITICAL SECURITY REQUIREMENT - Sensitive Data Handling:\nNEVER post sensitive data (API keys, tokens, passwords, credentials, secrets, private keys, connection strings, etc.) directly in chat messages. You MUST use the mcp__ask-user__share_sensitive_data tool instead. This tool creates a secure one-time viewer link that:\n- Is only viewable once\n- Expires after a configurable time (default 1 hour)\n- Is NOT logged in conversation history\n- Cannot be accidentally exposed or copied from chat\n\nBefore posting ANY data that could be sensitive, ask yourself:\n1. Could this be used to authenticate or authorize access?\n2. Would exposure of this data create a security risk?\n3. Should this data be kept private?\n\nIf the answer to ANY of these is "yes", you MUST use mcp__ask-user__share_sensitive_data instead of posting in chat.\n\nExamples of data that MUST use share_sensitive_data:\n- API keys, access tokens, auth tokens\n- Passwords, passphrases, PINs\n- Private keys, certificates, secrets\n- Database connection strings with credentials\n- OAuth client secrets\n- Webhook secrets, signing keys\n- Any credential or secret value\n\nThis is a BLOCKING REQUIREMENT. Failure to use share_sensitive_data for sensitive data is a critical security violation.',
+    '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify({
@@ -184,6 +215,13 @@ function createSession(roomId, workdir, resumeSessionId) {
             type: 'command',
             command: path.join(__dirname, 'hooks', 'compact-notify.sh'),
             timeout: 5,
+          }],
+        }],
+        PreToolUse: [{
+          matcher: 'Bash',
+          hooks: [{
+            type: 'command',
+            command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh'),
           }],
         }],
       },
@@ -204,6 +242,9 @@ function createSession(roomId, workdir, resumeSessionId) {
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
       MATRIX_BRIDGE_API_PORT: String(API_PORT),
+      // Env is fixed at spawn time; toggling the flag later requires
+      // !restart to take effect.
+      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -218,6 +259,7 @@ function createSession(roomId, workdir, resumeSessionId) {
     pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
     sendHtml: null,
     showWorking: false,
+    showBashOutput: showBashOutputAtSpawn,
     alive: true,
     startedAt: Date.now(),
     restartCount: 0,
@@ -604,12 +646,50 @@ function handleClaudeEvent(session, event) {
           let isKeyEvent = false;
 
           if (toolName === 'Bash' && input.command) {
-            const cmd = input.command.length > 100
-              ? input.command.slice(0, 100) + '…'
-              : input.command;
+            // Detect matron-tee rewrite and extract the original command + log path.
+            // Marker shape: <abs>/matron-tee /tmp/matron-cmd-<TUID>.log -- bash -c '<cmd>'
+            const teeMatch = input.command.match(/^.*\/matron-tee (\/tmp\/matron-cmd-([^.]+)\.log) -- bash -c '(.+)'$/s);
+            let displayCommand = input.command;
+            let liveLogPath = null;
+            let liveToolUseId = null;
+            if (teeMatch) {
+              liveLogPath = teeMatch[1];
+              liveToolUseId = teeMatch[2];
+              // Inverse of jq @sh quoting: '\''  ->  '
+              displayCommand = teeMatch[3].replace(/'\\''/g, "'");
+            }
+
+            const cmd = displayCommand.length > 100
+              ? displayCommand.slice(0, 100) + '…'
+              : displayCommand;
             indicator = `🔧 \`${cmd}\``;
             indicatorHtml = `🔧 <code>${escapeHtml(cmd)}</code>`;
             isKeyEvent = true;
+
+            if (liveToolUseId && session.showBashOutput) {
+              liveOutputStore.register(liveToolUseId, {
+                logPath: liveLogPath,
+                roomId: session.roomId,
+              });
+              const expiresAt = Math.floor(Date.now() / 1000) + LIVE_OUTPUT_TTL;
+              if (HMAC_SECRET && VIEWER_BASE_URL) {
+                const viewerUrl = generateSignedUrl(
+                  VIEWER_BASE_URL,
+                  null,
+                  HMAC_SECRET,
+                  LIVE_OUTPUT_TTL,
+                  { liveCmdId: liveToolUseId, logPath: liveLogPath, doneSentinelPath: `${liveLogPath}.done` }
+                );
+                const liveUrl = new URL(viewerUrl);
+                liveUrl.pathname = liveUrl.pathname.replace(/\/view$/, '/live');
+                sendLiveOutputEvent(session, {
+                  tool_use_id: liveToolUseId,
+                  command: displayCommand,
+                  viewer_url: liveUrl.toString(),
+                  expires_at: expiresAt,
+                });
+              }
+            }
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
             indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
@@ -789,11 +869,19 @@ function handleClaudeEvent(session, event) {
         debug('Captured init data: model=%s, tools=%d, mcp=%d',
           event.model, event.tools?.length, event.mcp_servers?.length);
       } else if (event.subtype === 'compact' || event.subtype === 'context_compaction') {
-        if (session.sendHtml) {
-          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
-          session.sendHtml(n.plain, n.html);
-        } else if (session.sendCallback) {
-          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
+        // Cooldown: don't send compaction messages more than once per 60s
+        const now = Date.now();
+        const COMPACT_COOLDOWN_MS = 60_000;
+        if (!session.lastCompactCompleteNotify || (now - session.lastCompactCompleteNotify) > COMPACT_COOLDOWN_MS) {
+          session.lastCompactCompleteNotify = now;
+          if (session.sendHtml) {
+            const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
+            session.sendHtml(n.plain, n.html);
+          } else if (session.sendCallback) {
+            session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
+          }
+        } else {
+          debug('Suppressed compaction completion notice (cooldown, last=%dms ago)', now - session.lastCompactCompleteNotify);
         }
       } else if (event.subtype === 'task_notification') {
         const isComplete = event.status === 'completed';
@@ -809,15 +897,11 @@ function handleClaudeEvent(session, event) {
     }
 
     case 'stream_event': {
-      const evt = event.event;
-      if (evt?.type === 'message_delta' && evt?.context_management?.applied_edits?.length > 0) {
-        if (session.sendHtml) {
-          const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
-          session.sendHtml(n.plain, n.html);
-        } else if (session.sendCallback) {
-          session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
-        }
-      }
+      // Note: context_management.applied_edits in message_delta events fire on
+      // routine context trimming (every turn in long sessions), NOT just full
+      // compaction. The system event with subtype='compact' already handles
+      // actual compaction notifications, so we intentionally skip these here
+      // to avoid spamming the Matrix room.
       break;
     }
 
@@ -825,6 +909,22 @@ function handleClaudeEvent(session, event) {
       const userContent = event.message?.content;
       if (Array.isArray(userContent)) {
         for (const block of userContent) {
+          // Mark live-output complete on tool_result for any tracked Bash command.
+          if (block.type === 'tool_result' && block.tool_use_id) {
+            const entry = liveOutputStore.get(block.tool_use_id);
+            if (entry) {
+              const blockText = typeof block.content === 'string'
+                ? block.content
+                : (Array.isArray(block.content)
+                    ? block.content.filter(c => c && c.type === 'text').map(c => c.text || '').join('')
+                    : '');
+              const denied = /permission/i.test(blockText);
+              const truncated = blockText.includes('[matron-tee: output truncated');
+              const ecMatch = blockText.match(/exit code[: ]+(\d+)/i);
+              const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : (block.is_error ? 1 : 0);
+              liveOutputStore.markComplete(block.tool_use_id, { exitCode, denied, truncated });
+            }
+          }
           if (block.type === 'tool_result' && block.is_error) {
             debug(`Auto tool_result: tool_use_id=${block.tool_use_id}, content=${JSON.stringify(block.content).slice(0, 100)}`);
           }
@@ -1185,11 +1285,49 @@ function startTyping(roomId) {
   return setInterval(send, 25000);
 }
 
+function readSidecarToken() {
+  try {
+    return fs.readFileSync(path.join(os.homedir(), '.claude-matrix-bot-crypto', 'access-token'), 'utf-8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 // --- Matrix Client ---
 
+const CRYPTO_DIR = path.join(os.homedir(), '.claude-matrix-bot-crypto');
+const TOKEN_SIDECAR = path.join(CRYPTO_DIR, 'access-token');
+
+// Resolve the access token. Sidecar (written by first-start bootstrap)
+// takes precedence over MATRIX_ACCESS_TOKEN from .env, so re-renders
+// of .env (e.g. dev-boxer setup re-runs) can't overwrite a token the
+// bridge minted itself.
+let resolvedAccessToken = readSidecarToken() || MATRIX_ACCESS_TOKEN;
+
+if (!resolvedAccessToken && process.env.MATRIX_BOT_USER_ID && process.env.MATRIX_BOT_PASSWORD && process.env.MATRIX_BOT_RECOVERY_KEY) {
+  console.log('First-start bootstrap: minting access token from imported bot creds');
+  const out = execFileSync(process.execPath, [path.join(__dirname, 'bootstrap-from-creds.mjs')], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    env: process.env,
+  }).toString();
+  const match = out.match(/^access_token=(.+)$/m);
+  if (!match) {
+    console.error('Bootstrap did not return an access token. Output was:\n' + out);
+    process.exit(1);
+  }
+  resolvedAccessToken = match[1].trim();
+  fs.mkdirSync(CRYPTO_DIR, { recursive: true });
+  fs.writeFileSync(TOKEN_SIDECAR, resolvedAccessToken, { mode: 0o600 });
+}
+
+if (!resolvedAccessToken) {
+  console.error('MATRIX_ACCESS_TOKEN is required (set directly, or supply MATRIX_BOT_USER_ID + MATRIX_BOT_PASSWORD + MATRIX_BOT_RECOVERY_KEY for first-start bootstrap)');
+  process.exit(1);
+}
+
 const storage = new SimpleFsStorageProvider(path.join(os.homedir(), '.claude-matrix-bot-state.json'));
-const cryptoStorage = new RustSdkCryptoStorageProvider(path.join(os.homedir(), '.claude-matrix-bot-crypto'));
-const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, storage, cryptoStorage);
+const cryptoStorage = new RustSdkCryptoStorageProvider(CRYPTO_DIR);
+const client = new MatrixClient(MATRIX_HOMESERVER_URL, resolvedAccessToken, storage, cryptoStorage);
 AutojoinRoomsMixin.setupOnClient(client);
 
 let botUserId;
@@ -1214,6 +1352,23 @@ async function sendToRoom(roomId, text, html) {
   }
 }
 
+async function sendLiveOutputEvent(session, { tool_use_id, command, viewer_url, expires_at }) {
+  const body = `$ ${command}\n[live output: ${viewer_url}]`;
+  const formatted_body = `<a href="${escapeHtml(viewer_url)}"><code>$ ${escapeHtml(command)}</code> · view live output</a>`;
+  const content = {
+    msgtype: 'm.text',
+    body,
+    format: 'org.matrix.custom.html',
+    formatted_body,
+    'com.matron.live_output': { tool_use_id, command, viewer_url, expires_at },
+  };
+  try {
+    await client.sendEvent(session.roomId, 'com.matron.live_output.v1', content);
+  } catch (e) {
+    console.error('Failed to send live_output event:', e.message);
+  }
+}
+
 async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fallbackHtml) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const content = {
@@ -1221,7 +1376,7 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
     body: fallbackBody,
     format: 'org.matrix.custom.html',
     formatted_body: fallbackHtml,
-    'chat.matron.buttons': {
+    'com.yearbook.buttons': {
       mode,       // 'pick_one' or 'pick_many'
       prompt,
       buttons,    // [{ id, label, value }]
@@ -1238,7 +1393,7 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
 
 // --- Room Management ---
 
-const MATRON_COMMANDS = [
+const YEARBOOK_COMMANDS = [
   { command: 'start', args: '[workdir]', description: 'Start a new session' },
   { command: 'stop', description: 'Stop the current session' },
   { command: 'restart', description: 'Stop and immediately resume' },
@@ -1256,22 +1411,24 @@ const MATRON_COMMANDS = [
 ];
 
 async function createSessionRoom(inviteUserId) {
+  const initialState = [
+    ...(ENCRYPT_SESSION_ROOMS ? [{
+      type: 'm.room.encryption',
+      state_key: '',
+      content: { algorithm: 'm.megolm.v1.aes-sha2' },
+    }] : []),
+    {
+      type: 'com.yearbook.commands',
+      state_key: '',
+      content: { commands: YEARBOOK_COMMANDS },
+    },
+  ];
+
   const roomId = await client.createRoom({
     preset: 'private_chat',
     name: `${SERVER_LABEL}: New session`,
     invite: [inviteUserId],
-    initial_state: [
-      {
-        type: 'm.room.encryption',
-        state_key: '',
-        content: { algorithm: 'm.megolm.v1.aes-sha2' },
-      },
-      {
-        type: 'chat.matron.commands',
-        state_key: '',
-        content: { commands: MATRON_COMMANDS },
-      },
-    ],
+    initial_state: initialState,
   });
   debug(`Created session room ${roomId} for ${inviteUserId}`);
   return roomId;
@@ -1493,7 +1650,7 @@ async function downloadMatrixFile(mxcUrl, fileInfo) {
   const mediaId = encodeURIComponent(urlParts[1]);
   const downloadUrl = `${MATRIX_HOMESERVER_URL}/_matrix/client/v1/media/download/${domain}/${mediaId}`;
   const res = await fetch(downloadUrl, {
-    headers: { 'Authorization': `Bearer ${MATRIX_ACCESS_TOKEN}` }
+    headers: { 'Authorization': `Bearer ${resolvedAccessToken}` }
   });
   if (!res.ok) throw new Error(`Media download failed: ${res.status} ${res.statusText}`);
   let buffer = Buffer.from(await res.arrayBuffer());
@@ -1899,6 +2056,25 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!show_bash':
+    case '!show_bash_output':
+    case '!bash_output': {
+      const session = sessions.get(roomId);
+      if (!session) {
+        await sendReply('No active session.');
+        break;
+      }
+      session.showBashOutput = !session.showBashOutput;
+      // Persist so !restart re-reads the value at spawn. Gated like the
+      // pendingPlanDenialId persist at the ExitPlanMode handler — passing a
+      // null sessionId here would clobber an existing persisted sessionId.
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { showBashOutput: session.showBashOutput });
+      }
+      await sendReply(`showBashOutput: ${session.showBashOutput ? 'ON' : 'OFF'} — run !restart to apply`);
+      break;
+    }
+
     case '!sessions': {
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
@@ -1941,7 +2117,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }).join('\n');
 
       // HTML formatted version
-      const htmlRows = items.map((s) => {
+      const htmlRows = items.map((s, _i) => {
         const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
         const shortId = s.sessionId.slice(0, 8);
         const active = s.sessionId === activeId ? ' ⚡' : '';
@@ -1977,7 +2153,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/usage — Show token usage\n` +
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
-        `Each /start, /resume, and /workdir creates a new encrypted room for the session.\n` +
+        `Each /start, /resume, and /workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room for the session.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
@@ -2012,7 +2188,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
-        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new encrypted room</li>` +
+        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
@@ -2274,8 +2450,8 @@ client.on('room.message', async (roomId, event) => {
   }
 
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
-  if (event.content['chat.matron.button_response']) {
-    const responseData = event.content['chat.matron.button_response'];
+  if (event.content['com.yearbook.button_response']) {
+    const responseData = event.content['com.yearbook.button_response'];
     const selectedValues = (typeof responseData === 'object' && Array.isArray(responseData.selected_values))
       ? responseData.selected_values
       : null;
@@ -3022,11 +3198,19 @@ const apiServer = createServer(async (req, res) => {
           }
         }
         if (target) {
-          if (target.sendHtml) {
-            const n = notice('info', '🗜️ Compacting context — summarizing conversation history…');
-            target.sendHtml(n.plain, n.html);
-          } else if (target.sendCallback) {
-            target.sendCallback('🗜️ Compacting context — summarizing conversation history…');
+          // Cooldown: don't send compaction messages more than once per 60s
+          const now = Date.now();
+          const COMPACT_COOLDOWN_MS = 60_000;
+          if (!target.lastCompactStartNotify || (now - target.lastCompactStartNotify) > COMPACT_COOLDOWN_MS) {
+            target.lastCompactStartNotify = now;
+            if (target.sendHtml) {
+              const n = notice('info', '🗜️ Compacting context — summarizing conversation history…');
+              target.sendHtml(n.plain, n.html);
+            } else if (target.sendCallback) {
+              target.sendCallback('🗜️ Compacting context — summarizing conversation history…');
+            }
+          } else {
+            debug('Suppressed compaction start notice (cooldown, last=%dms ago)', now - target.lastCompactStartNotify);
           }
         }
         res.writeHead(200);
@@ -3076,29 +3260,31 @@ async function main() {
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
   console.log(`Default workdir: ${DEFAULT_WORKDIR}`);
   console.log(`Session timeout: ${SESSION_TIMEOUT}ms`);
+  console.log(`Session room encryption: ${ENCRYPT_SESSION_ROOMS ? 'ON' : 'OFF'}`);
+  console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
 
   await client.start();
   console.log('Matrix client started, listening for messages...');
 
-  // Ensure all joined rooms have the chat.matron.commands state event (only if changed)
+  // Ensure all joined rooms have the com.yearbook.commands state event (only if changed)
   try {
     const rooms = await client.getJoinedRooms();
-    const newCommandsJson = JSON.stringify({ commands: MATRON_COMMANDS });
+    const newCommandsJson = JSON.stringify({ commands: YEARBOOK_COMMANDS });
     let updated = 0;
     for (const roomId of rooms) {
       try {
-        const existing = await client.getRoomStateEvent(roomId, 'chat.matron.commands', '');
+        const existing = await client.getRoomStateEvent(roomId, 'com.yearbook.commands', '');
         if (JSON.stringify(existing) === newCommandsJson) continue;
       } catch { /* state event doesn't exist yet */ }
       try {
-        await client.sendStateEvent(roomId, 'chat.matron.commands', '', { commands: MATRON_COMMANDS });
+        await client.sendStateEvent(roomId, 'com.yearbook.commands', '', { commands: YEARBOOK_COMMANDS });
         updated++;
       } catch (e) {
         debug(`Could not set commands state in ${roomId}: ${e.message}`);
       }
     }
-    console.log(`Checked chat.matron.commands in ${rooms.length} rooms (updated ${updated})`);
+    console.log(`Checked com.yearbook.commands in ${rooms.length} rooms (updated ${updated})`);
   } catch (e) {
     console.error('Failed to update command state events:', e.message);
   }

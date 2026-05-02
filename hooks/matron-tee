@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+// hooks/matron-tee
+// Usage: matron-tee <log-path> -- <command> [args...]
+import { spawn } from 'child_process';
+import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import path from 'path';
+
+const args = process.argv.slice(2);
+const sepIdx = args.indexOf('--');
+if (sepIdx < 1) {
+  console.error('Usage: matron-tee <log-path> -- <command> [args...]');
+  process.exit(2);
+}
+
+const logPath = args[0];
+const cmdArgs = args.slice(sepIdx + 1);
+const cmd = cmdArgs[0];
+const rest = cmdArgs.slice(1);
+
+const MAX_BYTES = parseInt(process.env.MATRON_LIVE_OUTPUT_MAX_BYTES || String(50 * 1024 * 1024), 10);
+
+const dir = path.dirname(logPath);
+if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+const log = createWriteStream(logPath);
+
+log.on('error', err => {
+  process.stderr.write(`[matron-tee: log write error: ${err.message}]\n`);
+  process.exit(126);
+});
+
+let bytesWritten = 0;
+let truncated = false;
+
+function pipe(source, sink) {
+  source.on('data', chunk => {
+    if (truncated) return;
+    if (bytesWritten + chunk.length > MAX_BYTES) {
+      const remaining = MAX_BYTES - bytesWritten;
+      if (remaining > 0) log.write(chunk.subarray(0, remaining));
+      log.write(`\n[matron-tee: output truncated at ${MAX_BYTES} bytes]\n`);
+      truncated = true;
+      bytesWritten = MAX_BYTES;
+      return;
+    }
+    bytesWritten += chunk.length;
+    log.write(chunk);
+    sink.write(chunk);
+  });
+}
+
+const child = spawn(cmd, rest, { stdio: ['inherit', 'pipe', 'pipe'] });
+pipe(child.stdout, process.stdout);
+pipe(child.stderr, process.stderr);
+
+child.on('close', (code, signal) => {
+  log.end(() => {
+    if (signal) process.kill(process.pid, signal);
+    else process.exit(code ?? 1);
+  });
+});
+
+child.on('error', err => {
+  log.write(`\n[matron-tee: spawn error: ${err.message}]\n`);
+  log.end(() => process.exit(127));
+});

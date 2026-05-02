@@ -24,6 +24,7 @@
     "express": "^5.2.1",
     "matrix-bot-sdk": "^0.8.0",
     "matrix-js-sdk": "^41.4.0",
+    "ws": "^8.20.0",
     "zod": "^4.4.1"
   },
   "devDependencies": {

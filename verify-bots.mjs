@@ -7,8 +7,8 @@
  *
  * Usage:
  *   node verify-bots.mjs --recovery-key-file ~/.matrix-recovery-key \
- *     --user @alice:matron.chat --password <pass> \
- *     --bot @dev-2:matron.chat --bot @dev-3:matron.chat
+ *     --user @dan:host --password <pass> \
+ *     --bot @dev-2:host --bot @dev-3:host
  *
  * Environment (used as defaults):
  *   MATRIX_HOMESERVER_URL  — Homeserver URL (default: from .env)
@@ -19,6 +19,7 @@ dotenv.config();
 
 import * as sdk from 'matrix-js-sdk';
 import { UserId } from '@matrix-org/matrix-sdk-crypto-wasm';
+import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/recovery-key.js';
 import { readFileSync } from 'fs';
 
 const HOMESERVER = process.env.MATRIX_HOMESERVER_URL || 'http://localhost:6167';
@@ -76,7 +77,7 @@ async function main() {
             cryptoCallbacks: {
                 getSecretStorageKey: async ({ keys }) => {
                     const keyId = Object.keys(keys)[0];
-                    if (!decodedKey) decodedKey = client.keyBackupKeyFromRecoveryKey(recoveryKey);
+                    if (!decodedKey) decodedKey = decodeRecoveryKey(recoveryKey);
                     return [keyId, decodedKey];
                 },
             },

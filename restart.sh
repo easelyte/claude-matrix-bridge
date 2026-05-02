@@ -18,9 +18,10 @@ if [ -n "$PORT_PID" ]; then
   kill $PORT_PID 2>/dev/null || true
 fi
 
-# Also kill any 'node index.js' started from this directory
+# Also kill any 'node index.js' started from this directory.
+# lsof works on both Linux and macOS; /proc/$pid/cwd is Linux-only.
 pgrep -f "node index.js" | while read pid; do
-  PROC_CWD=$(readlink /proc/$pid/cwd 2>/dev/null)
+  PROC_CWD=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}')
   if [ "$PROC_CWD" = "$(pwd)" ]; then
     echo "Killing bridge PID $pid (cwd match)"
     kill $pid 2>/dev/null || true
