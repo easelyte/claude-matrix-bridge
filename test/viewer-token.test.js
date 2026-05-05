@@ -4,7 +4,7 @@ beforeEach(() => { process.env.HMAC_SECRET = 'test-secret'; });
 
 describe('viewer token', () => {
   it('round-trips a live-output payload', async () => {
-    const { generateSignedUrl, verifyToken } = await import('../viewer/server.js');
+    const { generateSignedUrl, verifyToken } = await import('../lib/viewer-tokens.js');
     const url = generateSignedUrl('http://x', null, undefined, 60, {
       liveCmdId: 'toolu_1',
       logPath: '/tmp/a.log',
@@ -16,5 +16,13 @@ describe('viewer token', () => {
     expect(payload.logPath).toBe('/tmp/a.log');
     expect(payload.doneSentinelPath).toBe('/tmp/a.log.done');
     expect(payload.path).toBeUndefined();
+  });
+
+  it('rejects malformed signatures without throwing', async () => {
+    const { generateSignedUrl, verifyToken } = await import('../lib/viewer-tokens.js');
+    const url = generateSignedUrl('http://x', '/tmp/a.log', undefined, 60);
+    const token = url.split('token=')[1];
+
+    expect(verifyToken(`${token.slice(0, -8)}bad`)).toBeNull();
   });
 });

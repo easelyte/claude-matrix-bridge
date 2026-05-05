@@ -1,47 +1,17 @@
 import express from 'express';
-import crypto from 'crypto';
 import fs from 'fs/promises';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
+import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
+export { generateSignedUrl, verifyToken };
 
 const PORT = process.env.MATRIX_VIEWER_PORT || 9803;
 const SECRET = process.env.HMAC_SECRET;
-const TOKEN_EXPIRY_SECONDS = parseInt(process.env.TOKEN_EXPIRY || '3600', 10);
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
-
-// Generate a signed token for a file path or arbitrary payload
-// Token format: base64url(json({path, exp})) + '.' + hmac
-// When `extra` is provided, it replaces the default {path} payload (exp is always added).
-export function generateSignedUrl(baseUrl, filePath, secret = SECRET, expiry = TOKEN_EXPIRY_SECONDS, extra = null) {
-  const exp = Math.floor(Date.now() / 1000) + expiry;
-  const payloadObj = extra ? { ...extra, exp } : { path: filePath, exp };
-  const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
-  const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
-  return `${baseUrl}/view?token=${payload}.${sig}`;
-}
-
-export function verifyToken(token) {
-  const dotIdx = token.lastIndexOf('.');
-  if (dotIdx === -1) return null;
-
-  const payload = token.slice(0, dotIdx);
-  const sig = token.slice(dotIdx + 1);
-
-  const expectedSig = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) return null;
-
-  try {
-    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
-    if (data.exp < Math.floor(Date.now() / 1000)) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
 
 // Syntax highlighting via highlight.js CDN
 function renderHtml(filename, content) {
@@ -322,7 +292,21 @@ app.get('/sensitive', async (req, res) => {
   }
 });
 
+function scriptJsonString(value) {
+  return JSON.stringify(String(value)).replace(/[<>&\u2028\u2029]/g, char => {
+    switch (char) {
+      case '<': return '\\u003c';
+      case '>': return '\\u003e';
+      case '&': return '\\u0026';
+      case '\u2028': return '\\u2028';
+      case '\u2029': return '\\u2029';
+      default: return char;
+    }
+  });
+}
+
 function renderLiveHtml(token) {
+  const safeToken = scriptJsonString(token);
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -344,7 +328,7 @@ function renderLiveHtml(token) {
   out.addEventListener('scroll', () => {
     userScrolled = (out.scrollTop + out.clientHeight) < (out.scrollHeight - 20);
   });
-  const wsUrl = location.origin.replace(/^http/, 'ws') + '/live/ws?token=${token}';
+  const wsUrl = location.origin.replace(/^http/, 'ws') + '/live/ws?token=' + encodeURIComponent(${safeToken});
   const ws = new WebSocket(wsUrl);
   ws.onmessage = (ev) => {
     let msg;

@@ -136,7 +136,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `ALLOWED_USER_IDS` | Comma-separated Matrix user IDs (e.g. `@alice:matron.chat`) | `""` (any user) |
 | `DEFAULT_WORKDIR` | Default working directory for Claude Code sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `SESSION_TIMEOUT` | Session timeout in ms | `3600000` (1 hour) |
-| `ENCRYPT_SESSION_ROOMS` | Set to `0` to create unencrypted per-session rooms. Unset preserves encrypted rooms for existing deployments. | enabled when unset |
+| `ENCRYPT_SESSION_ROOMS` | Set to `0` to create unencrypted per-session rooms. Unset or `1` creates encrypted per-session rooms. | enabled |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `DEBUG` | Set to `1` to log raw JSON events from Claude Code | `0` |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |

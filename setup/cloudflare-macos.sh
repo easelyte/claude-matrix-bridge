@@ -101,17 +101,23 @@ if [ -z "$SERVICE_URL" ]; then
 fi
 
 json_get() {
-  local expr="$1"
-  # Keep call sites hardcoded. This intentionally evaluates a small JS accessor
-  # against trusted API JSON, not user-provided expressions.
+  # Accept one or more dot-separated property paths and print the first value
+  # present in stdin JSON. Numeric path segments index arrays.
   node -e '
     const fs = require("fs");
     const data = JSON.parse(fs.readFileSync(0, "utf8"));
-    const value = Function("data", `return (${process.argv[1]});`)(data);
-    if (value === undefined || value === null) process.exit(1);
-    if (typeof value === "object") console.log(JSON.stringify(value));
-    else console.log(String(value));
-  ' "$expr"
+    for (const path of process.argv.slice(1)) {
+      const value = path.split(".").reduce((node, part) => {
+        if (node === undefined || node === null) return undefined;
+        return node[part];
+      }, data);
+      if (value === undefined || value === null) continue;
+      if (typeof value === "object") console.log(JSON.stringify(value));
+      else console.log(String(value));
+      process.exit(0);
+    }
+    process.exit(1);
+  ' "$@"
 }
 
 api_request() {
@@ -123,7 +129,7 @@ api_request() {
   local raw
   raw="$(curl "${args[@]}")"
   local ok
-  ok="$(printf '%s' "$raw" | json_get 'data.success' 2>/dev/null || true)"
+  ok="$(printf '%s' "$raw" | json_get success 2>/dev/null || true)"
   if [ "$ok" != "true" ]; then
     echo "Cloudflare API request failed: $method $path_value" >&2
     printf '%s' "$raw" | node -e '
@@ -133,7 +139,7 @@ api_request() {
     ' >&2 || true
     exit 1
   fi
-  printf '%s' "$raw" | json_get 'data.result'
+  printf '%s' "$raw" | json_get result
 }
 
 require_hostname() {
@@ -194,9 +200,9 @@ resolve_zone() {
     exit 1
   }
 
-  ZONE_ID="$(printf '%s' "$selected" | json_get 'data.id')"
+  ZONE_ID="$(printf '%s' "$selected" | json_get id)"
   if [ -z "$ACCOUNT_ID" ]; then
-    ACCOUNT_ID="$(printf '%s' "$selected" | json_get 'data.account && data.account.id' 2>/dev/null || true)"
+    ACCOUNT_ID="$(printf '%s' "$selected" | json_get account.id 2>/dev/null || true)"
   fi
 }
 
@@ -217,9 +223,9 @@ create_tunnel() {
   local body result
   body="$(TUNNEL_NAME="$TUNNEL_NAME" node -e 'console.log(JSON.stringify({ name: process.env.TUNNEL_NAME, config_src: "local" }))')"
   result="$(api_request POST "/accounts/${ACCOUNT_ID}/cfd_tunnel" "$body")"
-  TUNNEL_ID="$(printf '%s' "$result" | json_get 'data.id || (data.credentials_file && data.credentials_file.TunnelID)')"
+  TUNNEL_ID="$(printf '%s' "$result" | json_get id credentials_file.TunnelID)"
   mkdir -p "$(dirname "$CREDENTIALS_PATH")"
-  printf '%s' "$result" | json_get 'data.credentials_file' > "$CREDENTIALS_PATH.tmp"
+  printf '%s' "$result" | json_get credentials_file > "$CREDENTIALS_PATH.tmp"
   install -m 600 "$CREDENTIALS_PATH.tmp" "$CREDENTIALS_PATH"
   rm -f "$CREDENTIALS_PATH.tmp"
   echo "Created tunnel: $TUNNEL_NAME ($TUNNEL_ID)"
@@ -271,7 +277,7 @@ upsert_dns() {
   local target existing existing_id body
   target="${TUNNEL_ID}.cfargotunnel.com"
   existing="$(api_request GET "/zones/${ZONE_ID}/dns_records?type=CNAME&name=${HOSTNAME_VALUE}")"
-  existing_id="$(printf '%s' "$existing" | json_get 'data[0] && data[0].id' 2>/dev/null || true)"
+  existing_id="$(printf '%s' "$existing" | json_get 0.id 2>/dev/null || true)"
   body="$(HOSTNAME_VALUE="$HOSTNAME_VALUE" TARGET="$target" node -e 'console.log(JSON.stringify({ type: "CNAME", name: process.env.HOSTNAME_VALUE, content: process.env.TARGET, proxied: true }))')"
 
   if [ -n "$existing_id" ]; then

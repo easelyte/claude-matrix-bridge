@@ -146,7 +146,7 @@ reload_service() {
 }
 
 write_plist "$BRIDGE_PLIST" "$BRIDGE_LABEL" "index.js" "$LOG_DIR/claude-matrix-bridge.log"
-write_plist "$VIEWER_PLIST" "$VIEWER_LABEL" "viewer/server.js" "$LOG_DIR/claude-matrix-file-viewer.log"
+write_plist "$VIEWER_PLIST" "$VIEWER_LABEL" "viewer/start.js" "$LOG_DIR/claude-matrix-file-viewer.log"
 
 reload_service "$BRIDGE_LABEL" "$BRIDGE_PLIST"
 reload_service "$VIEWER_LABEL" "$VIEWER_PLIST"

@@ -44,7 +44,7 @@ Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$REPO_DIR
 EnvironmentFile=$REPO_DIR/.env
-ExecStart=$NODE_BIN $REPO_DIR/viewer/server.js
+ExecStart=$NODE_BIN $REPO_DIR/viewer/start.js
 Restart=always
 RestartSec=5
 
