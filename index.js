@@ -32,12 +32,8 @@ const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT || '3600000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
-const MATRIX_EVENT_NAMESPACE = 'com.matron';
-const LEGACY_MATRIX_EVENT_NAMESPACE = 'com.yearbook';
-const COMMAND_EVENT_TYPES = [
-  `${MATRIX_EVENT_NAMESPACE}.commands`,
-  `${LEGACY_MATRIX_EVENT_NAMESPACE}.commands`,
-];
+const MATRIX_EVENT_NAMESPACE = 'chat.matron';
+const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON)
@@ -1387,12 +1383,6 @@ async function sendButtonMessage(roomId, prompt, buttons, mode, fallbackBody, fa
       prompt,
       buttons,    // [{ id, label, value }]
     },
-    // Keep deployed clients working while they migrate from the Yearbook namespace.
-    [`${LEGACY_MATRIX_EVENT_NAMESPACE}.buttons`]: {
-      mode,
-      prompt,
-      buttons,
-    },
   };
   try {
     const eventId = await client.sendMessage(roomId, content);
@@ -2462,8 +2452,7 @@ client.on('room.message', async (roomId, event) => {
   }
 
   // Handle native button responses (supports both legacy `true` and structured `{ selected_values }` formats)
-  const buttonResponse = event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`]
-    || event.content[`${LEGACY_MATRIX_EVENT_NAMESPACE}.button_response`];
+  const buttonResponse = event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
   if (buttonResponse) {
     const selectedValues = (typeof buttonResponse === 'object' && Array.isArray(buttonResponse.selected_values))
       ? buttonResponse.selected_values
