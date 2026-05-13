@@ -666,18 +666,17 @@ function handleClaudeEvent(session, event) {
           let isKeyEvent = false;
 
           if (toolName === 'Bash' && input.command) {
-            // Detect matron-tee rewrite and extract the original command + log path.
-            // Marker shape: <abs>/matron-tee /tmp/matron-cmd-<TUID>.log -- bash -c '<cmd>'
-            const teeMatch = input.command.match(/^.*\/matron-tee (\/tmp\/matron-cmd-([^.]+)\.log) -- bash -c '(.+)'$/s);
-            let displayCommand = input.command;
-            let liveLogPath = null;
-            let liveToolUseId = null;
-            if (teeMatch) {
-              liveLogPath = teeMatch[1];
-              liveToolUseId = teeMatch[2];
-              // Inverse of jq @sh quoting: '\''  ->  '
-              displayCommand = teeMatch[3].replace(/'\\''/g, "'");
-            }
+            // Claude Code's `tool_use` event reports the ORIGINAL command, not
+            // the matron-tee-rewritten one (the rewrite is visible only in the
+            // later `system.task_started` event). So we don't try to parse the
+            // marker out of input.command — instead we predict the log path
+            // deterministically from `block.id`, which matches what the hook
+            // writes (`/tmp/matron-cmd-<tool_use_id>.log`). If MATRON_BASH_TEE
+            // was disabled at spawn, the file won't exist and the viewer will
+            // show its "Output expired" / WS-failed state.
+            const displayCommand = input.command;
+            const liveToolUseId = block.id;
+            const liveLogPath = `/tmp/matron-cmd-${liveToolUseId}.log`;
 
             const cmd = displayCommand.length > 100
               ? displayCommand.slice(0, 100) + '…'
@@ -686,7 +685,7 @@ function handleClaudeEvent(session, event) {
             indicatorHtml = `🔧 <code>${escapeHtml(cmd)}</code>`;
             isKeyEvent = true;
 
-            if (liveToolUseId && session.showBashOutput) {
+            if (session.showBashOutput) {
               liveOutputStore.register(liveToolUseId, {
                 logPath: liveLogPath,
                 roomId: session.roomId,
