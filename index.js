@@ -13,6 +13,7 @@ import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
+import { macifyMcpServers } from './lib/mcp-config-mac.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
@@ -36,10 +37,16 @@ const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
-// Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON)
+// Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
+// The on-disk baseline assumes Linux (xvfb-run wraps puppeteer/chrome-devtools); on macOS
+// we strip that wrapper before writing the generated file so those MCP servers actually
+// start instead of failing with `spawn xvfb-run ENOENT`.
 const MCP_CONFIG_PATH = path.join(__dirname, '.mcp-config-generated.json');
-const mcpConfig = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
+let mcpConfig = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
 mcpConfig.mcpServers['ask-user'].args[0] = path.join(__dirname, 'ask-user.js');
+if (process.platform === 'darwin') {
+  mcpConfig = macifyMcpServers(mcpConfig);
+}
 fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(mcpConfig, null, 2));
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
