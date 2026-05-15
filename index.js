@@ -410,15 +410,23 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
     },
   };
 
-  const claudeArgs = [
-    '--session-id', sessionId,
+  // The CLI rejects --session-id + --resume together unless --fork-session
+  // is also passed. For fresh sessions we pre-assign --session-id so we know
+  // the transcript path before spawn; for resumes we pass --resume only and
+  // rely on the already-known sessionId for the transcript path.
+  const claudeArgs = [];
+  if (resumeSessionId) {
+    claudeArgs.push('--resume', resumeSessionId);
+  } else {
+    claudeArgs.push('--session-id', sessionId);
+  }
+  claudeArgs.push(
     '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--mcp-config', MCP_CONFIG_PATH,
     '--settings', JSON.stringify(settings),
-  ];
-  if (resumeSessionId) claudeArgs.push('--resume', resumeSessionId);
+  );
 
   const nodeBinDir = path.dirname(process.execPath);
   const existingPath = process.env.PATH || '';
