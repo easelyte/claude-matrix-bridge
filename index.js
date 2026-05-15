@@ -3609,8 +3609,16 @@ const apiServer = createServer(async (req, res) => {
             if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
           }
         }
-        if (target && typeof target.onTurnEnd === 'function') {
-          try { target.onTurnEnd(); } catch (e) { debug('onTurnEnd handler threw:', e?.message); }
+        if (target) {
+          // Drain the transcript tail synchronously so any assistant event
+          // written just before the Stop hook is processed (and the
+          // response buffer populated) before onTurnEnd flushes.
+          if (target.iv && typeof target.iv.drainTranscript === 'function') {
+            try { target.iv.drainTranscript(); } catch (e) { debug('drainTranscript threw:', e?.message); }
+          }
+          if (typeof target.onTurnEnd === 'function') {
+            try { target.onTurnEnd(); } catch (e) { debug('onTurnEnd handler threw:', e?.message); }
+          }
         }
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
