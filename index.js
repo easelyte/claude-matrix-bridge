@@ -13,6 +13,7 @@ import os from 'os';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
+import { createInteractiveSession } from './lib/interactive-session.js';
 import { macifyMcpServers } from './lib/mcp-config-mac.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -34,6 +35,7 @@ const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical li
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
 const MATRIX_EVENT_NAMESPACE = 'chat.matron';
+const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
 
@@ -200,6 +202,9 @@ function getPersistedSession(roomId) {
 const sessions = new Map(); // roomId -> session
 
 function createSession(roomId, workdir, resumeSessionId) {
+  if (INTERACTIVE_MODE) {
+    return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId);
+  }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
   // showBashOutput is persisted via persistSession on toggle and re-read here at
@@ -372,6 +377,164 @@ function createSession(roomId, workdir, resumeSessionId) {
   });
 
   session.resetTimeout = () => {}; // no-op, kept for call-site compatibility
+
+  sessions.set(roomId, session);
+  return session;
+}
+
+// --- Interactive-mode session (MATRON_INTERACTIVE_MODE=1) ---
+//
+// Spawns claude in a PTY instead of --print. Events come from the on-disk
+// JSONL transcript (via TranscriptTail), turn-end comes from the Stop hook,
+// plan approval comes from the PreToolUse:ExitPlanMode hook. Returns a
+// session object with the same shape as createSession() so downstream code
+// (Matrix posting, queue management, restart) is unchanged.
+function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId) {
+  const cwd = expandHome(workdir || DEFAULT_WORKDIR);
+  const persistedForRoom = getPersistedSession(roomId);
+  const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
+  const sessionId = resumeSessionId || randomUUID();
+
+  const settings = {
+    hooks: {
+      PreCompact: [{
+        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
+      }],
+      PreToolUse: [
+        { matcher: 'Bash', hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh') }] },
+        { matcher: 'ExitPlanMode', hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'exit-plan-decision.sh'), timeout: 1800 }] },
+      ],
+      Stop: [{
+        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'stop-notify.sh'), timeout: 10 }],
+      }],
+    },
+  };
+
+  const claudeArgs = [
+    '--session-id', sessionId,
+    '--dangerously-skip-permissions',
+    '--disallowed-tools', 'AskUserQuestion',
+    '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
+    '--mcp-config', MCP_CONFIG_PATH,
+    '--settings', JSON.stringify(settings),
+  ];
+  if (resumeSessionId) claudeArgs.push('--resume', resumeSessionId);
+
+  const nodeBinDir = path.dirname(process.execPath);
+  const existingPath = process.env.PATH || '';
+  const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
+
+  debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
+
+  const iv = createInteractiveSession({
+    roomId,
+    workdir: cwd,
+    sessionId,
+    claudeArgs,
+    env: {
+      ...process.env,
+      PATH: pathWithNode,
+      CLAUDECODE: '',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+      BRIDGE_ROOM_ID: roomId,
+      MATRIX_BRIDGE_API_PORT: String(API_PORT),
+      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    },
+  });
+
+  // Same shape as the --print session object. `proc` is null in iv mode;
+  // call sites that need raw input go via session.iv.sendText / sendKeystroke
+  // (wired up in Task 4.2).
+  const session = {
+    proc: null,
+    iv,
+    roomId,
+    workdir: cwd,
+    responseBuffer: '',
+    sendCallback: null,
+    pendingPlan: null,
+    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
+    sendHtml: null,
+    sendButtonMessage: null,
+    showWorking: false,
+    showBashOutput: showBashOutputAtSpawn,
+    alive: true,
+    startedAt: Date.now(),
+    restartCount: 0,
+    claudeSessionId: sessionId,
+    busy: false,
+    lineBuf: '',
+    toolCalls: [],
+    waitingForAnswer: null,
+    originRoomId: null,
+    firstMessageCaptured: false,
+    initData: null,
+    totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
+    turnCount: 0,
+    chatHistory: [],
+    pinnedSummaryEventId: null,
+    pinnedSummaryText: '',
+    pendingWelcome: true,
+    pendingInteractivePrompt: null,
+  };
+
+  iv.on('event', event => {
+    debug('IV event:', event.type);
+    handleClaudeEvent(session, event);
+  });
+
+  iv.on('prompt', prompt => {
+    debug('IV prompt:', prompt.kind, prompt.question);
+    // Task 4.3 wires this through to Matrix.
+    session.pendingInteractivePrompt = prompt;
+  });
+
+  iv.on('parseError', err => {
+    debug('IV transcript parse error:', err.line?.slice(0, 80));
+  });
+
+  iv.on('exit', exitCode => {
+    session.alive = false;
+    debug(`Interactive claude session ${sessionId} exited code=${exitCode}`);
+    flushResponse(session);
+    if (sessions.get(roomId) === session) {
+      if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        const restarted = createSession(roomId, cwd, session.claudeSessionId);
+        restarted.restartCount = session.restartCount + 1;
+        restarted.sendCallback = session.sendCallback;
+        restarted.sendHtml = session.sendHtml;
+        restarted.sendButtonMessage = session.sendButtonMessage;
+        restarted.originRoomId = session.originRoomId;
+        restarted.firstMessageCaptured = session.firstMessageCaptured;
+        sessions.set(roomId, restarted);
+        if (restarted.sendHtml) {
+          const n = notice('warning',
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+          restarted.sendHtml(n.plain, n.html);
+        } else if (restarted.sendCallback) {
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
+        }
+      } else {
+        sessions.delete(roomId);
+        if (session.sendHtml) {
+          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
+          session.sendHtml(n.plain, n.html);
+        } else if (session.sendCallback) {
+          session.sendCallback(`[Session ended (exit ${exitCode})]`);
+        }
+      }
+    }
+  });
+
+  session.resetTimeout = () => {};
+
+  // Hook handler stubs — Task 4.2/4.3 fill these in. Defining them here so the
+  // /turn-end and /plan-decision HTTP endpoints find a callable method.
+  session.onTurnEnd = () => {
+    session.busy = false;
+    if (session.typingInterval) { clearInterval(session.typingInterval); session.typingInterval = null; }
+  };
 
   sessions.set(roomId, session);
   return session;
