@@ -4,7 +4,7 @@
   "description": "Bridge Matrix messages directly to Claude Code CLI sessions",
   "type": "module",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "main": "index.js",
   "scripts": {
@@ -12,7 +12,7 @@
     "test": "vitest run",
     "bootstrap-crosssigning": "node bootstrap-crosssigning.mjs",
     "lint": "eslint . --max-warnings=0",
-    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check setup-user.mjs && node --check verify-bots.mjs && node --check bootstrap-crosssigning.mjs && node --check lib/transcribe.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js",
+    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check setup-user.mjs && node --check verify-bots.mjs && node --check bootstrap-crosssigning.mjs && node --check add-bot.mjs && node --check lib/transcribe.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js",
     "audit:high": "npm audit --audit-level=high",
     "ci": "npm run lint && npm run check && npm test && npm run audit:high"
   },

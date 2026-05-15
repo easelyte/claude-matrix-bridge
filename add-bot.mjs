@@ -34,6 +34,7 @@ import { writeFileSync } from 'fs';
 
 const HOMESERVER = process.env.MATRIX_HOMESERVER_URL || 'http://localhost:6167';
 const VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
+const JOIN_TIMEOUT_MS = 2 * 60 * 1000;
 
 // Mirror setup-user.mjs's noise suppression so the operator only sees flow steps.
 const origLog = console.log;
@@ -166,11 +167,37 @@ async function findOrCreateDM(client, userId) {
   return created.room_id;
 }
 
+// Wait for the target user to actually join the DM before we send any
+// verification request into it. If the user is still in "invite" state
+// when we send m.key.verification.request, their client will only see
+// the request when it later joins the room — at which point it arrives
+// as a backfilled historical event and Element (web/desktop, X, and
+// matrix-rust-sdk-based clients) silently ignore it for verification UI
+// purposes. Without this wait, the prompt never surfaces.
+async function waitForUserToJoinRoom(client, roomId, userId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    // Force a fresh fetch rather than relying on client.getRoom(),
+    // which lags behind initial sync on a brand-new room.
+    let members;
+    try {
+      members = await client.getJoinedRoomMembers(roomId);
+    } catch {
+      members = { joined: {} };
+    }
+    if (members.joined && Object.prototype.hasOwnProperty.call(members.joined, userId)) {
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error(`Timed out after ${timeoutMs / 1000}s waiting for ${userId} to join the verification DM. Open the invite in Element first.`);
+}
+
 async function ensureUserIdentityKnown(cryptoApi, userId, accessToken) {
   for (let attempt = 1; attempt <= 5; attempt++) {
     await cryptoApi.userHasCrossSigningKeys(userId, true);
     let identity = await cryptoApi.olmMachine.getIdentity(new UserId(userId));
-    if (identity) return;
+    if (identity) return identity;
 
     const queryResp = await fetch(`${HOMESERVER}/_matrix/client/v3/keys/query`, {
       method: 'POST',
@@ -179,16 +206,70 @@ async function ensureUserIdentityKnown(cryptoApi, userId, accessToken) {
     });
     await cryptoApi.olmMachine.markRequestAsSent('keys-query', attempt, JSON.stringify(await queryResp.json()));
     identity = await cryptoApi.olmMachine.getIdentity(new UserId(userId));
-    if (identity) return;
+    if (identity) return identity;
 
     await new Promise(r => setTimeout(r, 1000));
   }
   throw new Error(`Could not find cross-signing identity for ${userId}`);
 }
 
+// After SAS verification the bot has the user's master key marked as
+// verified locally, but the matching signature (bot's user-signing key
+// over the user's master key) only reaches the server if the rust SDK
+// happens to flush its outgoing-request queue before we log out. In
+// practice the queue is racy and the signature often gets dropped, so
+// Element on the user's side reports "verification failed" even though
+// the user has already signed the bot. Explicitly force-sign the user
+// here and POST the signature ourselves so the result is deterministic.
+async function crossSignUserFromBot(cryptoApi, userId, accessToken) {
+  // Re-fetch identity (don't reuse the one from before SAS — it now has
+  // the user's master key in a verified state which lets verify() emit
+  // a self-signing signature request).
+  await cryptoApi.userHasCrossSigningKeys(userId, true);
+  const identity = await cryptoApi.olmMachine.getIdentity(new UserId(userId));
+  if (!identity) {
+    throw new Error(`No cross-signing identity for ${userId} after SAS`);
+  }
+
+  const request = await identity.verify();
+  const uploadResp = await fetch(`${HOMESERVER}/_matrix/client/v3/keys/signatures/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: request.body,
+  });
+  const uploadBody = await uploadResp.text();
+  if (!uploadResp.ok) {
+    throw new Error(`signatures/upload returned HTTP ${uploadResp.status}: ${uploadBody.slice(0, 500)}`);
+  }
+  const result = JSON.parse(uploadBody);
+  const failures = result.failures || {};
+  if (Object.keys(failures).length > 0) {
+    throw new Error('signatures/upload failures: ' + JSON.stringify(failures));
+  }
+
+  // The signature is now on the server but our local olm machine won't
+  // know about it until we re-query the user's keys and feed the
+  // response back in. Without this refresh, getUserVerificationStatus
+  // immediately afterwards still returns the pre-upload state.
+  const queryResp = await fetch(`${HOMESERVER}/_matrix/client/v3/keys/query`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_keys: { [userId]: [] } }),
+  });
+  const queryBody = await queryResp.text();
+  if (!queryResp.ok) {
+    throw new Error(`keys/query returned HTTP ${queryResp.status}: ${queryBody.slice(0, 500)}`);
+  }
+  await cryptoApi.olmMachine.markRequestAsSent('post-cross-sign-keys-query', 1, queryBody);
+}
+
 async function sendVerificationAndAwait(client, cryptoApi, userId, accessToken) {
   const dmRoomId = await findOrCreateDM(client, userId);
   await ensureUserIdentityKnown(cryptoApi, userId, accessToken);
+  log(`  -> DM ${dmRoomId} ready; waiting for ${userId} to join before sending verification request`);
+  log(`     (Element won't render the verification prompt if the request lands before the user joins.)`);
+  await waitForUserToJoinRoom(client, dmRoomId, userId, JOIN_TIMEOUT_MS);
+  log(`  -> ${userId} joined; sending verification request`);
   const request = await cryptoApi.requestVerificationDM(userId, dmRoomId);
   log(`  -> Verification request sent to ${userId}`);
   log(`     Open Element and accept the verification request, then confirm the emoji match.`);
@@ -290,18 +371,19 @@ async function main() {
       log('Sending verification request');
       await sendVerificationAndAwait(session.client, session.cryptoApi, user, session.loginData.access_token);
       log('  verification done — bot master key signed by user');
-    }
 
-    if (!skipVerification) {
-      log('  verification done — checking cross-signing status');
-      try {
+      log('Cross-signing user from bot side');
+      await crossSignUserFromBot(session.cryptoApi, user, session.loginData.access_token);
+      log(`  ${user} master key signed by bot user-signing key`);
+
+      let crossVerified = false;
+      for (let attempt = 1; attempt <= 5; attempt++) {
         const status = await session.cryptoApi.getUserVerificationStatus(user);
-        if (!status.isCrossSigningVerified()) {
-          log('  ⚠ SAS completed but bot has not cross-verified the user — proceeding anyway');
-          // Don't throw — the bridge will still function, just without the green-shield UX.
-        }
-      } catch (e) {
-        log('  ⚠ could not check cross-signing status: ' + e.message);
+        if (status.isCrossSigningVerified()) { crossVerified = true; break; }
+        await new Promise(r => setTimeout(r, 500));
+      }
+      if (!crossVerified) {
+        throw new Error(`Bot still does not see ${user} as cross-verified after explicit signature upload`);
       }
     }
 

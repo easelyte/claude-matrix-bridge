@@ -8,13 +8,13 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 22+ (matrix-js-sdk 41.x uses `Promise.withResolvers`, which only landed in v22)
 - Claude Code CLI installed and authenticated
 - A Matrix homeserver, such as [matron-server](https://github.com/matronhq/matron-server), Matron's branch of Tuwunel, with a bot account
 
 **Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm). For voice notes: `setup/install-whisper.sh` will install the rest.
 
-**macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@20`. For voice notes: `setup/install-whisper.sh` will run `brew install whisper-cpp ffmpeg` automatically.
+**macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@22`. For voice notes: `setup/install-whisper.sh` will run `brew install whisper-cpp ffmpeg` automatically.
 
 For public file and secret viewer links on macOS, install `cloudflared` if you want to publish the local viewer through Cloudflare Tunnel:
 
