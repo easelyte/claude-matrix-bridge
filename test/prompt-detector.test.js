@@ -121,6 +121,30 @@ describe('classifyScreen — null cases', () => {
   it('returns null when only the input box is visible', () => {
     expect(classifyScreen('\n\n> ')).toBeNull();
   });
+
+  it('returns null on claude TUI welcome screen (the false-positive that broke iv-mode cutover)', () => {
+    // Real reproduction: ❯ marks the input placeholder, followed by a
+    // box-drawing separator and a status line with ⏵⏵ / ◉ chrome.
+    const screen = [
+      '────────────────────────────────────────',
+      '❯ Try "edit <filepath> to..."',
+      '────────────────────────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)     ◉ xhigh · /effort',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('still returns arrow-menu when there IS a real question above the marker', () => {
+    const screen = [
+      'Which model would you like to use?',
+      '❯ Sonnet',
+      '  Opus',
+      '  Haiku',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('arrow-menu');
+  });
 });
 
 describe('PromptDetector', () => {
