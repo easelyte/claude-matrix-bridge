@@ -11,6 +11,16 @@ describe('stripAnsi', () => {
   it('removes bare CR that has no LF after it (TUI overwrites)', () => {
     expect(stripAnsi('foo\rbar\r\nbaz')).toBe('foobar\nbaz');
   });
+
+  it('replaces CSI cursor-forward with the corresponding number of spaces', () => {
+    // claude renders gaps between words as \x1b[1C rather than literal spaces.
+    expect(stripAnsi('Yes,\x1b[1Cmanually\x1b[1Capprove\x1b[1Cedits'))
+      .toBe('Yes, manually approve edits');
+    expect(stripAnsi('\x1b[3CIndented'))
+      .toBe('   Indented');
+    // \x1b[C with no digits = 1
+    expect(stripAnsi('a\x1b[Cb')).toBe('a b');
+  });
 });
 
 describe('classifyScreen — yes/no', () => {
