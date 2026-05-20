@@ -310,6 +310,61 @@ describe('classifyScreen — first option glued onto heading line', () => {
   });
 });
 
+describe('classifyScreen — selection marker on a non-first item', () => {
+  // Real capture from running the `/theme` slash command in claude's TUI:
+  // option 1 is on its own line (no glued heading), the heading
+  // ("Choose the text style…") has no trailing `?` or `:`, and the `❯`
+  // cursor sits on the CURRENT selection (option 2) — not option 1.
+  // The earlier `firstItemMarked` check only looked at the run's first
+  // line, so all three gate conditions failed and the picker was missed,
+  // which left iv-mode sessions hung with no surfaced menu.
+  it('classifies the /theme runtime picker (cursor on option 2)', () => {
+    // Indentation matches an actual PTY capture: option 1 sits flush left,
+    // the cursor line `❯ 2.` is indented by two columns, options 3..N
+    // return to flush-left. The mismatched indent makes the arrow-menu
+    // detector reject the run (siblings out-dent the marker), so the
+    // numbered detector is the only thing that can catch this picker.
+    const screen = [
+      'Theme',
+      '',
+      'Choose the text style that looks best with your terminal',
+      '',
+      '1. Auto (match terminal)',
+      '  ❯ 2. Dark mode ✔',
+      '3. Light mode',
+      '4. Dark mode (colorblind-friendly)',
+      '5. Light mode (colorblind-friendly)',
+      '6. Dark mode (ANSI colors only)',
+      '7. Light mode (ANSI colors only)',
+      '8. New custom theme…',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.key)).toEqual(['1', '2', '3', '4', '5', '6', '7', '8']);
+    expect(r.options[0].label).toMatch(/^Auto \(match terminal\)/);
+    expect(r.options[1].label).toMatch(/^Dark mode/);
+    expect(r.question).toMatch(/Choose the text style/);
+  });
+
+  it('classifies a lettered run when the cursor sits on a later option', () => {
+    // Same shape as the numbered case: the cursor line is indented but the
+    // surrounding option lines are flush left, so arrow-menu detection
+    // bails on the indent mismatch and the lettered detector must accept
+    // the run on the strength of the `❯` marker alone.
+    const screen = [
+      'Pick a flavour',
+      'a) Vanilla',
+      '  ❯ b) Chocolate',
+      'c) Strawberry',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('lettered');
+    expect(r.options.map(o => o.key)).toEqual(['a', 'b', 'c']);
+  });
+});
+
 describe('classifyScreen — multiple numbered runs', () => {
   it('picks the run that passes the menu guard, not the longest run', () => {
     // Real screen from iv-mode testing: a "Verification" numbered list
