@@ -53,6 +53,18 @@ describe('extractMcpExtraFlags', () => {
   it('exposes the recognised extras list for sanity checks', () => {
     expect(knownMcpExtras()).toContain('browser');
   });
+
+  // Regression: a plain-object lookup table would silently consume tokens
+  // that match Object.prototype member names ("constructor", "toString",
+  // "__proto__") because bracket access falls through the prototype chain
+  // and returns a truthy function. The Map-backed table avoids this.
+  it('does not consume positional args that share Object.prototype names', () => {
+    expect(extractMcpExtraFlags(['constructor'])).toEqual({ extras: [], rest: ['constructor'] });
+    expect(extractMcpExtraFlags(['toString'])).toEqual({ extras: [], rest: ['toString'] });
+    expect(extractMcpExtraFlags(['__proto__'])).toEqual({ extras: [], rest: ['__proto__'] });
+    expect(extractMcpExtraFlags(['hasOwnProperty', '--browser']))
+      .toEqual({ extras: ['browser'], rest: ['hasOwnProperty'] });
+  });
 });
 
 describe('buildMcpServers', () => {
