@@ -365,6 +365,43 @@ describe('classifyScreen — selection marker on a non-first item', () => {
   });
 });
 
+describe('classifyScreen — numbered menu with description sub-lines between options', () => {
+  // Real reproduction from a Claude AskUserQuestion-style prompt. Each
+  // numbered option has one or more indented description lines underneath
+  // (and sometimes blank lines between options). Previously each numbered
+  // line was a length-1 run so the numbered detector skipped them all,
+  // and the arrow-menu fallback slurped the descriptions as siblings —
+  // surfacing 9 "options" instead of 4.
+  it('detects 4 numbered options even when description lines interleave', () => {
+    const screen = [
+      "match the editor's Arial+canvas layout exactly, or should the editor switch to Liberation+opentype to match the bake? Which direction do you want?",
+      '❯ 1. Bake should match editor (Arial layout)',
+      '  Change buildEntryPathData and the CLI to use Arial canvas measurements (or simulate them with opentype using the',
+      '  right metrics) so bakes match what users saw in preview.',
+      '',
+      '  2. Editor should match bake (Liberation paths)',
+      '  Change useNumberDesignJsx/computeMaxFontSize/packer to size names using opentype Liberation Sans metrics so the',
+      '  editor preview matches the bake output.',
+      '',
+      '  3. Not sure — let me investigate first',
+      "  I'll dig into the editor/bake code paths and report back with a recommendation before making changes.",
+      '',
+      '  4. Type something.',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(4);
+    expect(r.options.map(o => o.key)).toEqual(['1', '2', '3', '4']);
+    expect(r.options[0].label).toMatch(/^Bake should match editor/);
+    expect(r.options[1].label).toMatch(/^Editor should match bake/);
+    expect(r.options[2].label).toMatch(/^Not sure/);
+    expect(r.options[3].label).toMatch(/^Type something/);
+    // Descriptions must NOT become options.
+    expect(r.options.map(o => o.label).join('|')).not.toMatch(/buildEntryPathData|useNumberDesignJsx|dig into the editor/);
+  });
+});
+
 describe('classifyScreen — multiple numbered runs', () => {
   it('picks the run that passes the menu guard, not the longest run', () => {
     // Real screen from iv-mode testing: a "Verification" numbered list
