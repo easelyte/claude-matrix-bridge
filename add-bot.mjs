@@ -141,6 +141,15 @@ async function bootstrapBotIdentity(client, cryptoApi, loginData, password, secr
   });
 
   await cryptoApi.bootstrapCrossSigning({
+    // setupNewCrossSigning forces a fresh master/self/user signing key
+    // triple instead of trying to restore the existing ones from SSSS.
+    // Without this, re-running add-bot for an existing bot fails with
+    // "Error decrypting secret m.cross_signing.master: bad MAC" because
+    // bootstrapSecretStorage already minted a new SSSS key while the
+    // existing master is encrypted under the previous SSSS key (which
+    // is unrecoverable if the original add-bot run didn't persist its
+    // recovery key — e.g. it failed before writing the creds file).
+    setupNewCrossSigning: true,
     authUploadDeviceSigningKeys: async (makeRequest) => {
       return makeRequest({
         type: 'm.login.password',
