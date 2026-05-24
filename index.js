@@ -854,10 +854,11 @@ function maybeResolveInteractivePrompt(session, userText) {
       }, 250);
       return true;
     }
-    const help = `Reply not understood. Please answer with the option number (1–${p.options.length}).`;
-    if (session.sendHtml) session.sendHtml(help, null);
-    else if (session.sendCallback) session.sendCallback(help);
-    return true; // consumed — invalid format, but don't forward to claude
+    // Unmatched reply: dismiss the prompt and let the message through to
+    // Claude as normal input. This prevents false-positive detections from
+    // blocking the user's free-form messages.
+    session.pendingInteractivePrompt = null;
+    return false;
   }
   // Resolve the human-readable label so the Matrix confirmation tells the
   // user *what* we sent to claude — without this, the bridge silently
@@ -1422,6 +1423,10 @@ function handleClaudeEvent(session, event) {
         // and-flush-on-result flow.
         if (session.iv && !isPartial && session.responseBuffer.trim() && !session.waitingForAnswer) {
           flushResponse(session);
+          // Clear the prompt detector buffer after flushing an assistant
+          // response so numbered lists in the response text don't trigger
+          // false-positive prompt detections during the post-response idle.
+          session.iv.detector.reset();
         }
       }
 

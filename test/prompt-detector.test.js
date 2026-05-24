@@ -548,6 +548,27 @@ describe('classifyScreen — null cases', () => {
     expect(classifyScreen(screen)).toBeNull();
   });
 
+  it('returns null when question text contains TUI chrome glyphs (response text false positive)', () => {
+    // Claude's response text can contain numbered lists preceded by garbled
+    // status chrome — the ✢ and ● glyphs are TUI decorations, not part of
+    // a real interactive prompt. Regression test for a live false positive.
+    const screen = [
+      '4though for 4s) ✢ · ✢ ●Two issues to fix:',
+      '1. Replace the hand-rolled modal with SimpleModal',
+      '2. Change em dash to regular hyphen in HoodieSlotNameValues::inputLabel()',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('returns null when question text contains ● (geometric shape chrome)', () => {
+    const screen = [
+      'Status: ● running — tasks to do:',
+      '1. Fix the tests',
+      '2. Update the docs',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
   it('handles cursor-positioning-stripped output where marker + number + label have no spaces', () => {
     // After ANSI/CSI strip of a TUI that positions characters via cursor
     // moves, the lines look like "❯1.Yes,andbypasspermissions" — no space
