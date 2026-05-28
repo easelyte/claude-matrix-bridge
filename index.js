@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -239,6 +239,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const live = sessions.get(roomId);
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  if (live && live.worktree) derived.worktree = live.worktree;
   data[String(roomId)] = {
     ...existing,
     ...derived,
@@ -283,12 +284,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
-    '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify({
+      permissions: {
+        allow: [
+          'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'Glob(*)', 'Grep(*)',
+          'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'NotebookEdit(*)',
+        ],
+        deny: [],
+      },
       hooks: {
         PreCompact: [{
           hooks: [{
@@ -309,6 +316,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   ];
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId);
+  }
+
+  // --worktree <name>: spawn Claude in an isolated git worktree. Claude
+  // handles creation (`.claude/worktrees/<name>`) and branch management
+  // (`worktree-<name>`). Useful for parallel sessions that shouldn't
+  // share filesystem state.
+  const worktreeName = options.worktree || null;
+  if (worktreeName) {
+    args.push('--worktree', worktreeName);
   }
 
   debug(`Spawning claude with args: ${args.join(' ')}`);
@@ -344,6 +360,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
+    worktree: worktreeName,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -431,7 +448,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // state, but a print-mode session that crashes before its session_id
         // is delivered hasn't been persisted yet, and would silently respawn
         // without the user's --browser opt-in.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras, worktree: session.worktree });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -499,6 +516,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const sessionId = resumeSessionId || randomUUID();
 
   const settings = {
+    permissions: {
+      allow: [
+        'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'Glob(*)', 'Grep(*)',
+        'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'NotebookEdit(*)',
+      ],
+      deny: [],
+    },
     hooks: {
       PreCompact: [{
         hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
@@ -527,8 +551,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   } else {
     claudeArgs.push('--session-id', sessionId);
   }
+  const worktreeName = options.worktree || null;
   claudeArgs.push(
-    '--dangerously-skip-permissions',
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
@@ -537,6 +561,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify(settings),
   );
+  if (worktreeName) {
+    claudeArgs.push('--worktree', worktreeName);
+  }
 
   const nodeBinDir = path.dirname(process.execPath);
   const existingPath = process.env.PATH || '';
@@ -568,6 +595,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
+    worktree: worktreeName,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -653,7 +681,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras, worktree: session.worktree });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -2698,7 +2726,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: positional } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(parts.slice(1));
+      const { worktree, rest: positional } = extractWorktreeFlag(afterExtras);
       const arg = positional[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
@@ -2733,7 +2762,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
+      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras, worktree });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -2749,7 +2778,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Confirm in origin room with a link to the new room
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`Session started in new room: ${roomLink}${extrasNote}`);
+      const worktreeNote = worktree ? ` (worktree: ${worktree})` : '';
+      await sendReply(`Session started in new room: ${roomLink}${extrasNote}${worktreeNote}`);
 
       // Welcome message will be sent when user joins (see room.join handler)
       break;
@@ -2786,17 +2816,19 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // session ID. Passing no flags preserves whatever extras the session
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
-      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: restartFlagExtras, rest: restartRest } = extractMcpExtraFlags(parts.slice(1));
+      const { worktree: restartWorktree } = extractWorktreeFlag(restartRest);
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
         : (carriedExtras || []);
+      const effectiveWorktree = restartWorktree || existing.worktree || null;
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
       sessions.delete(roomId);
       killSession(existing);
       await sendReply('🔄 Restarting session...');
-      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras });
+      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras, worktree: effectiveWorktree });
       restarted.sendCallback = sendReply;
       restarted.sendHtml = sendHtml;
       restarted.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
@@ -3020,17 +3052,22 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const shortId = session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '…' : '(pending)';
       const busyText = session.busy ? 'yes' : 'no';
 
+      const worktreeText = session.worktree ? `\nWorktree: ${session.worktree}` : '';
       const plainStatus =
-        `Session active\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
+        `Session active\nWorkdir: ${session.workdir}${worktreeText}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
 
       const busyHtml = session.busy
         ? color('● busy', '#f0883e')
         : color('● idle', '#3fb950');
+      const worktreeRow = session.worktree
+        ? `<tr><td>Worktree</td><td><code>${escapeHtml(session.worktree)}</code></td></tr>`
+        : '';
       const htmlStatus =
         `<b>Session Status</b><table>` +
         `<tr><td>State</td><td>${busyHtml}</td></tr>` +
         `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
+        worktreeRow +
         `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
         `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
         `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
@@ -3139,8 +3176,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start — Start a new session (creates a new room)\n` +
         `/start <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
+        `/start --worktree <name> — Start in an isolated git worktree (branch: worktree-<name>)\n` +
         `/stop — Stop the current session\n` +
-        `/restart — Stop and immediately resume the session (--browser also accepted)\n` +
+        `/restart — Stop and immediately resume the session (--browser, --worktree also accepted)\n` +
         `/resume <n> — Resume session #n from /sessions list\n` +
         `/resume <id> — Resume session by ID prefix (--browser also accepted)\n` +
         `/sessions — List all past sessions\n` +
