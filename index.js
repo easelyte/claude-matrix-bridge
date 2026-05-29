@@ -445,6 +445,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        // Don't auto-restart if the workdir was removed (e.g. worktree
+        // cleaned up after merge). The session is legitimately over.
+        if (!fs.existsSync(cwd)) {
+          sessions.delete(roomId);
+          const notice = '▌ Session workdir no longer exists (worktree removed after merge?). Use !start to begin a new session.';
+          if (session.sendCallback) session.sendCallback(notice);
+          return;
+        }
         // Pass mcpExtras explicitly: createSession can fall back to persisted
         // state, but a print-mode session that crashes before its session_id
         // is delivered hasn't been persisted yet, and would silently respawn
@@ -679,6 +687,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        if (!fs.existsSync(cwd)) {
+          sessions.delete(roomId);
+          const notice = '▌ Session workdir no longer exists (worktree removed after merge?). Use !start to begin a new session.';
+          if (session.sendCallback) session.sendCallback(notice);
+          return;
+        }
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
@@ -2867,30 +2881,45 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
       const resumeWorkdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
+      const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
       const encodedPath = resumeWorkdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
 
-      if (!fs.existsSync(projectDir)) {
+      // Scan base workdir + worktree-derived dirs
+      const candidateDirs = [];
+      try {
+        for (const d of fs.readdirSync(projectsRoot)) {
+          if (d === encodedPath || d.startsWith(encodedPath)) candidateDirs.push(d);
+        }
+      } catch { /* projectsRoot doesn't exist */ }
+
+      if (candidateDirs.length === 0) {
         await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
         return;
       }
 
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => f.replace('.jsonl', ''))
-        .sort((a, b) => {
-          const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
-          const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
-          return sb.mtimeMs - sa.mtimeMs;
-        });
+      const files = [];
+      const fileToDir = new Map();
+      for (const encoded of candidateDirs) {
+        const dir = path.join(projectsRoot, encoded);
+        try {
+          for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.jsonl'))) {
+            const sid = f.replace('.jsonl', '');
+            const stat = fs.statSync(path.join(dir, f));
+            files.push({ sid, mtimeMs: stat.mtimeMs, dir });
+            fileToDir.set(sid, dir);
+          }
+        } catch { /* dir unreadable */ }
+      }
+      files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const sortedFiles = files.map(f => f.sid);
 
       let resumeSessionId;
       let actualWorkdir = resumeWorkdir;
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
-      if (!isNaN(num) && num >= 1 && num <= files.length) {
-        resumeSessionId = files[num - 1];
+      if (!isNaN(num) && num >= 1 && num <= sortedFiles.length) {
+        resumeSessionId = sortedFiles[num - 1];
       } else {
-        const match = files.find(f => f.startsWith(resumeArg));
+        const match = sortedFiles.find(f => f.startsWith(resumeArg));
         if (match) {
           resumeSessionId = match;
         } else {
@@ -3118,24 +3147,31 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const prev = getPersistedSession(roomId);
       const workdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
 
+      // Scan the base workdir project dir AND any worktree-derived dirs
+      // so that sessions started via --worktree are discoverable.
+      const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
       const encodedPath = workdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+      const candidateDirs = [encodedPath];
+      try {
+        for (const d of fs.readdirSync(projectsRoot)) {
+          if (d.startsWith(encodedPath) && d !== encodedPath) candidateDirs.push(d);
+        }
+      } catch { /* projectsRoot doesn't exist */ }
 
-      if (!fs.existsSync(projectDir)) {
-        await sendReply('No sessions found for this workdir.');
-        break;
+      const files = [];
+      for (const encoded of candidateDirs) {
+        const projectDir = path.join(projectsRoot, encoded);
+        try {
+          for (const f of fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'))) {
+            const sessionId = f.replace('.jsonl', '');
+            const filePath = path.join(projectDir, f);
+            const stat = fs.statSync(filePath);
+            const summary = getSessionSummary(sessionId, workdir) || getSessionSummary(sessionId, projectDir);
+            files.push({ sessionId, modified: stat.mtimeMs, summary, projectDir });
+          }
+        } catch { /* dir unreadable */ }
       }
-
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => {
-          const sessionId = f.replace('.jsonl', '');
-          const filePath = path.join(projectDir, f);
-          const stat = fs.statSync(filePath);
-          const summary = getSessionSummary(sessionId, workdir);
-          return { sessionId, modified: stat.mtimeMs, summary };
-        })
-        .sort((a, b) => b.modified - a.modified);
+      files.sort((a, b) => b.modified - a.modified);
 
       if (files.length === 0) {
         await sendReply('No sessions found.');
@@ -3197,7 +3233,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
-        `  Send "interrupt" to force interrupt\n\n` +
+        `  Send "send" to flush the queue\n` +
+        `  Send "interrupt" or "escape" to cancel the current turn (like Escape in terminal)\n\n` +
         `Send any other text to chat with Claude Code.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
@@ -3710,7 +3747,7 @@ client.on('room.message', async (roomId, event) => {
   }
   if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
-    if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
+    if (lowerText === 'send') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
       stripQueueNotificationLinks(session);
@@ -3727,6 +3764,21 @@ client.on('room.message', async (roomId, event) => {
       } else {
         await sendReply('⚡ No queued messages to send.');
       }
+      return;
+    }
+    if (lowerText === 'interrupt' || lowerText === '!interrupt' || lowerText === 'escape') {
+      // Escape-like interrupt: send SIGINT to cancel the current turn,
+      // then flush any queued messages so the next user message goes through.
+      try {
+        if (session.iv) session.iv.sendKeystroke('escape');
+        else if (session.proc) session.proc.kill('SIGINT');
+      } catch (e) { debug(`interrupt signal error: ${e.message}`); }
+      const queued = session.queuedMessages || [];
+      session.queuedMessages = null;
+      stripQueueNotificationLinks(session);
+      session.busy = false;
+      if (session.typingInterval) { clearInterval(session.typingInterval); session.typingInterval = null; }
+      await sendReply(`⚡ Interrupted.${queued.length > 0 ? ` ${queued.length} queued message${queued.length > 1 ? 's' : ''} dropped.` : ''}`);
       return;
     }
     if (lowerText === 'cancel') {
