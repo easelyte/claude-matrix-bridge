@@ -2756,8 +2756,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     }
 
     case '!esc':
-    case '!escape':
-    case '!interrupt': {
+    case '!escape': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
         await sendReply('No active session.');
@@ -2766,6 +2765,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       try {
         if (session.iv) {
           session.iv.sendKeystroke('esc');
+          if (session.busy) {
+            session.busy = false;
+            if (session.typingInterval) {
+              clearInterval(session.typingInterval);
+              session.typingInterval = null;
+              client.setTyping(session.roomId, false, 1000).catch(() => {});
+            }
+          }
         } else if (session.proc?.stdin?.writable) {
           const msg = JSON.stringify({
             type: 'control_request',
@@ -3223,7 +3230,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
-<<<<<<< HEAD
         `<li><code>send</code>/<code>interrupt</code> flush the queue; <code>!esc</code> cancels the turn; <code>cancel</code> drops last queued message</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
@@ -3431,7 +3437,7 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
-      'esc', 'escape', 'interrupt',
+      'esc', 'escape',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
