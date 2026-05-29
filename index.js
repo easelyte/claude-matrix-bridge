@@ -321,8 +321,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // --worktree <name>: spawn Claude in an isolated git worktree. Claude
   // handles creation (`.claude/worktrees/<name>`) and branch management
   // (`worktree-<name>`). Useful for parallel sessions that shouldn't
-  // share filesystem state.
-  const worktreeName = options.worktree || null;
+  // share filesystem state. Explicit option wins; fall back to persisted
+  // value so resume/restart/auto-resume preserve isolation.
+  const worktreeName = options.worktree || persistedForRoom?.worktree || null;
   if (worktreeName) {
     args.push('--worktree', worktreeName);
   }
@@ -551,7 +552,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   } else {
     claudeArgs.push('--session-id', sessionId);
   }
-  const worktreeName = options.worktree || null;
+  const worktreeName = options.worktree || persistedForRoom?.worktree || null;
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
@@ -2958,7 +2959,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
         : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
-      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras });
+      const effectiveResumeWorktree = resumePersisted?.worktree || null;
+      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras, worktree: effectiveResumeWorktree });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
       session.sendCallback = sessionSendReply;
