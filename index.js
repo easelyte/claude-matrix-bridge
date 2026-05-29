@@ -2892,34 +2892,40 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
       const encodedPath = resumeWorkdir.replace(/\//g, '-');
 
-      // Scan base workdir + worktree-derived dirs (exact match or
-      // Claude's worktree naming: <encoded>--claude-worktrees-<name>)
-      const worktreeInfix = '--claude-worktrees-';
-      const candidateDirs = [];
-      try {
-        for (const d of fs.readdirSync(projectsRoot)) {
-          if (d === encodedPath || d.startsWith(encodedPath + worktreeInfix)) candidateDirs.push(d);
-        }
-      } catch { /* projectsRoot doesn't exist */ }
+      const projectDir = path.join(projectsRoot, encodedPath);
 
-      if (candidateDirs.length === 0) {
-        await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
+      // Build session list from base workdir + persisted worktree sessions
+      const resumeFiles = [];
+      const seenResumeIds = new Set();
+      try {
+        for (const f of fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'))) {
+          const sid = f.replace('.jsonl', '');
+          const stat = fs.statSync(path.join(projectDir, f));
+          resumeFiles.push({ sid, mtimeMs: stat.mtimeMs });
+          seenResumeIds.add(sid);
+        }
+      } catch { /* dir doesn't exist */ }
+      const allPersistedForResume = loadPersistedSessions();
+      for (const entry of Object.values(allPersistedForResume)) {
+        if (!entry.sessionId || seenResumeIds.has(entry.sessionId)) continue;
+        if (!entry.worktree) continue;
+        if (entry.workdir && entry.workdir !== resumeWorkdir) continue;
+        const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
+        const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
+        try {
+          const stat = fs.statSync(wtPath);
+          resumeFiles.push({ sid: entry.sessionId, mtimeMs: stat.mtimeMs });
+          seenResumeIds.add(entry.sessionId);
+        } catch { /* transcript gone */ }
+      }
+
+      if (resumeFiles.length === 0) {
+        await sendReply(`No sessions found for workdir: ${resumeWorkdir}`);
         return;
       }
 
-      const files = [];
-      for (const encoded of candidateDirs) {
-        const dir = path.join(projectsRoot, encoded);
-        try {
-          for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.jsonl'))) {
-            const sid = f.replace('.jsonl', '');
-            const stat = fs.statSync(path.join(dir, f));
-            files.push({ sid, mtimeMs: stat.mtimeMs, dir });
-          }
-        } catch { /* dir unreadable */ }
-      }
-      files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-      const sortedFiles = files.map(f => f.sid);
+      resumeFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const sortedFiles = resumeFiles.map(f => f.sid);
 
       let resumeSessionId;
       let actualWorkdir = resumeWorkdir;
@@ -3155,31 +3161,40 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const prev = getPersistedSession(roomId);
       const workdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
 
-      // Scan the base workdir project dir AND worktree-derived dirs.
-      // Only match dirs that are exactly the encoded workdir OR follow
-      // Claude's worktree naming: <encoded>--claude-worktrees-<name>
+      // Scan the base workdir project dir for transcripts, then augment
+      // with persisted sessions (which include worktree sessions that
+      // have transcripts in different project dirs).
       const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
       const encodedPath = workdir.replace(/\//g, '-');
-      const worktreeInfix = '--claude-worktrees-';
-      const candidateDirs = [];
-      try {
-        for (const d of fs.readdirSync(projectsRoot)) {
-          if (d === encodedPath || (d.startsWith(encodedPath + worktreeInfix))) candidateDirs.push(d);
-        }
-      } catch { /* projectsRoot doesn't exist */ }
+      const projectDir = path.join(projectsRoot, encodedPath);
 
       const files = [];
-      for (const encoded of candidateDirs) {
-        const projectDir = path.join(projectsRoot, encoded);
+      const seenIds = new Set();
+      // 1. Scan base workdir transcripts
+      try {
+        for (const f of fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'))) {
+          const sessionId = f.replace('.jsonl', '');
+          const stat = fs.statSync(path.join(projectDir, f));
+          const summary = getSessionSummary(sessionId, workdir);
+          files.push({ sessionId, modified: stat.mtimeMs, summary });
+          seenIds.add(sessionId);
+        }
+      } catch { /* dir doesn't exist */ }
+      // 2. Add persisted worktree sessions whose transcripts live elsewhere
+      const allPersisted = loadPersistedSessions();
+      for (const entry of Object.values(allPersisted)) {
+        if (!entry.sessionId || seenIds.has(entry.sessionId)) continue;
+        if (!entry.worktree) continue;
+        if (entry.workdir && entry.workdir !== workdir) continue;
+        // Find the transcript in the worktree project dir
+        const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
+        const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
         try {
-          for (const f of fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'))) {
-            const sessionId = f.replace('.jsonl', '');
-            const filePath = path.join(projectDir, f);
-            const stat = fs.statSync(filePath);
-            const summary = getSessionSummary(sessionId, workdir) || getSessionSummary(sessionId, projectDir);
-            files.push({ sessionId, modified: stat.mtimeMs, summary, projectDir });
-          }
-        } catch { /* dir unreadable */ }
+          const stat = fs.statSync(wtPath);
+          const summary = getSessionSummary(entry.sessionId, workdir);
+          files.push({ sessionId: entry.sessionId, modified: stat.mtimeMs, summary, worktree: entry.worktree });
+          seenIds.add(entry.sessionId);
+        } catch { /* transcript gone */ }
       }
       files.sort((a, b) => b.modified - a.modified);
 
