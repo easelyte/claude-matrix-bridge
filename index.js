@@ -3154,7 +3154,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !usage — Token usage\n` +
         `  !tools — Available tools\n` +
         `  !help — This help message\n\n` +
-        `! = bridge command. Other / commands are forwarded to Claude Code CLI.\n\n` +
+        `Use ! for bridge commands. / also works for the above, but\n` +
+        `unrecognized / commands are forwarded to Claude Code CLI.\n\n` +
         `Each !start, !resume, and !workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
@@ -3190,7 +3191,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!help', 'This help message'],
         ]) +
         `<b>Tips</b><ul>` +
-        `<li><code>!</code> = bridge command. Other <code>/</code> commands are forwarded to Claude Code CLI.</li>` +
+        `<li>Use <code>!</code> for bridge commands. <code>/</code> also works for the above, but unrecognized <code>/</code> commands forward to Claude Code CLI.</li>` +
         `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
