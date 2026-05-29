@@ -49,7 +49,11 @@ const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical li
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
 const FILE_UPLOAD_ENABLED = process.env.MATRON_FILE_UPLOAD !== '0';
-const FILE_UPLOAD_MAX_BYTES = parseInt(process.env.MATRON_FILE_UPLOAD_MAX_BYTES || '5242880', 10);
+const FILE_UPLOAD_MAX_BYTES = (() => {
+  const n = parseInt(process.env.MATRON_FILE_UPLOAD_MAX_BYTES || '5242880', 10);
+  if (!Number.isFinite(n) || n <= 0) return 5242880;
+  return n;
+})();
 const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
