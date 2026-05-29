@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import fs from 'fs';
+import _fs from 'fs';
 import path from 'path';
 import { mkdtempSync, rmSync, writeFileSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
-import { mimeForPath, isSensitivePath, resolveInWorkdir, uploadFileToRoom, logUploadDecision } from '../lib/file-uploader.js';
+import { mimeForPath, isSensitivePath, resolveInWorkdir, uploadFileToRoom } from '../lib/file-uploader.js';
 
 describe('mimeForPath', () => {
   it('returns correct MIME for known extensions', () => {
@@ -117,7 +117,7 @@ describe('uploadFileToRoom', () => {
     tmpDir = mkdtempSync(path.join(tmpdir(), 'file-upload-test-'));
     mockClient = {
       crypto: {
-        encryptMedia: vi.fn(async (buf) => ({
+        encryptMedia: vi.fn(async (_buf) => ({
           buffer: Buffer.from('encrypted'),
           file: { key: { kty: 'oct', key_ops: ['encrypt', 'decrypt'], alg: 'A256CTR', k: 'testkey', ext: true }, iv: 'testiv', hashes: { sha256: 'testhash' }, v: 'v2' },
         })),
