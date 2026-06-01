@@ -2787,6 +2787,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!clearall':
     case '!flush': {
       const session = sessions.get(roomId);
       if (!session) {
@@ -3229,7 +3230,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!start &lt;workdir&gt;', 'Start in a specific directory'],
           ['!start --browser [workdir]', 'Also enable chrome-devtools MCP (~400M)'],
           ['!esc', 'Interrupt current turn (jumps the queue)'],
-          ['!flush', 'Drop all queued messages'],
+          ['!clearall', 'Drop all queued messages'],
           ['!stop', 'Stop the current session'],
           ['!restart', 'Stop and resume (--browser accepted)'],
           ['!resume &lt;n|id&gt;', 'Resume session by number or ID (--browser accepted)'],
@@ -3458,7 +3459,7 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
-      'esc', 'escape', 'flush',
+      'esc', 'escape', 'clearall', 'flush',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
