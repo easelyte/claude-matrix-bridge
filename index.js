@@ -1481,6 +1481,11 @@ function handleClaudeEvent(session, event) {
 
   switch (event.type) {
     case 'assistant': {
+      // Cancel Enter retry — the turn started successfully
+      if (session._enterRetryTimer) {
+        clearTimeout(session._enterRetryTimer);
+        session._enterRetryTimer = null;
+      }
       const content = event.message?.content;
       if (!Array.isArray(content)) break;
 
@@ -1975,6 +1980,33 @@ function flushResponse(session) {
   session.lastActivityAt = Date.now();
 }
 
+function clearBusyAfterEsc(session) {
+  session.busy = false;
+  if (session.typingInterval) {
+    clearInterval(session.typingInterval);
+    session.typingInterval = null;
+    client.setTyping(session.roomId, false, 1000).catch(() => {});
+  }
+  // Safety net: Esc-cancelled turns don't fire the Stop hook, so onTurnEnd
+  // never runs. If something re-sets busy during the cancellation wind-down
+  // (e.g. a late transcript event processed between now and the TUI returning
+  // to the input prompt), re-clear after a delay. The 2s window covers the
+  // typical Esc → input-prompt transition.
+  if (session._escBusyTimer) clearTimeout(session._escBusyTimer);
+  session._escBusyTimer = setTimeout(() => {
+    session._escBusyTimer = null;
+    if (session.busy && session.alive) {
+      debug('[ESC] Safety timer: re-clearing busy after Esc cancellation');
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+    }
+  }, 2000);
+}
+
 function sendToSession(session, contentBlocks) {
   if (!session.alive || session._autoStopped) return false;
 
@@ -1999,6 +2031,30 @@ function sendToSession(session, contentBlocks) {
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
       session.iv.sendText(text);
+      // Enter retry: after sending text, the 500ms delayed Enter may be
+      // swallowed if the TUI isn't fully ready (especially post-resume).
+      // Watch for transcript activity (assistant/tool event) — if none
+      // arrives within 3s, retry Enter. Up to 2 retries.
+      let retries = 0;
+      const maxRetries = 2;
+      const retryMs = 3000;
+      function scheduleRetry() {
+        if (retries >= maxRetries) return;
+        session._enterRetryTimer = setTimeout(() => {
+          session._enterRetryTimer = null;
+          if (!session.alive || !session.iv?.alive) return;
+          if (!session.busy) return;
+          // Check if claude has started responding (responseBuffer non-empty
+          // or turnCount increased since we sent)
+          if (session.responseBuffer.trim()) return;
+          retries++;
+          debug(`[IV] Enter retry ${retries}/${maxRetries} — no response after ${retryMs}ms`);
+          session.iv.sendKeystroke('enter');
+          scheduleRetry();
+        }, retryMs);
+        if (typeof session._enterRetryTimer.unref === 'function') session._enterRetryTimer.unref();
+      }
+      scheduleRetry();
       if (session.resetTimeout) session.resetTimeout();
       return true;
     }
@@ -3854,17 +3910,7 @@ client.on('room.message', async (roomId, event) => {
     if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
       try {
         session.iv.sendKeystroke('esc');
-        // Clear bridge-side busy state since claude won't fire a Stop
-        // hook after a user-cancelled turn — leaving busy=true would
-        // queue every subsequent message.
-        if (session.busy) {
-          session.busy = false;
-          if (session.typingInterval) {
-            clearInterval(session.typingInterval);
-            session.typingInterval = null;
-            client.setTyping(session.roomId, false, 1000).catch(() => {});
-          }
-        }
+        clearBusyAfterEsc(session);
         await sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
         await sendReply(`Could not send Esc: ${err.message}`);
@@ -3894,16 +3940,12 @@ client.on('room.message', async (roomId, event) => {
       return;
     }
     if (lowerText === 'interrupt' || lowerText === '!interrupt' || lowerText === 'escape') {
-      // Escape-like interrupt: send SIGINT/Escape to cancel the current
-      // turn. Don't clear busy — let the normal result/exit path do that
-      // so subsequent messages don't interleave with the cancelling turn.
-      // Queue is preserved; the user can send new messages once the
-      // cancellation completes and busy clears naturally.
       try {
         if (session.iv) session.iv.sendKeystroke('esc');
         else if (session.proc) session.proc.kill('SIGINT');
       } catch (e) { debug(`interrupt signal error: ${e.message}`); }
       session._interrupted = true;
+      if (session.iv) clearBusyAfterEsc(session);
       await sendReply('⚡ Interrupt sent — waiting for current turn to cancel.');
       return;
     }
@@ -4652,6 +4694,8 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
 
 function killSession(session, signal = 'SIGTERM') {
   if (!session) return;
+  if (session._enterRetryTimer) { clearTimeout(session._enterRetryTimer); session._enterRetryTimer = null; }
+  if (session._escBusyTimer) { clearTimeout(session._escBusyTimer); session._escBusyTimer = null; }
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
   // stops it, but belt-and-braces.
