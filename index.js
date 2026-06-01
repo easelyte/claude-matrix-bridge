@@ -52,6 +52,46 @@ const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+const ROLES_FILE = path.join(os.homedir(), '.claude-matrix-roles.json');
+
+// --- Role management ---
+
+const roles = new Map();
+
+function loadRoles() {
+  try {
+    if (fs.existsSync(ROLES_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ROLES_FILE, 'utf-8'));
+      for (const [userId, role] of Object.entries(data)) {
+        if (role === 'admin' || role === 'member') roles.set(userId, role);
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load roles file:', e.message);
+  }
+  if (ALLOWED_USER_IDS.length > 0 && !Array.from(roles.values()).includes('admin')) {
+    roles.set(ALLOWED_USER_IDS[0], 'admin');
+  }
+}
+
+function saveRoles() {
+  const tmp = ROLES_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(roles), null, 2));
+    fs.renameSync(tmp, ROLES_FILE);
+    return true;
+  } catch (e) {
+    console.error('Failed to save roles file:', e.message);
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    return false;
+  }
+}
+
+function getUserRole(userId) {
+  return roles.get(userId) || 'member';
+}
+
+loadRoles();
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -2558,13 +2598,29 @@ async function createSessionRoom(inviteUserId) {
     })),
   ];
 
+  const userPL = getUserRole(inviteUserId) === 'admin' ? 50 : 0;
   const roomId = await client.createRoom({
     preset: 'private_chat',
     name: `${SERVER_LABEL}: New session`,
     invite: [inviteUserId],
     initial_state: initialState,
+    power_level_content_override: {
+      users: {
+        [await client.getUserId()]: 100,
+        [inviteUserId]: userPL,
+      },
+      invite: 100,
+      kick: 100,
+      ban: 100,
+      redact: 100,
+      state_default: 100,
+      events: {
+        'm.room.name': 50,
+        'm.room.topic': 50,
+      },
+    },
   });
-  debug(`Created session room ${roomId} for ${inviteUserId}`);
+  debug(`Created session room ${roomId} for ${inviteUserId} (role=${getUserRole(inviteUserId)}, PL=${userPL})`);
   return roomId;
 }
 
@@ -3318,6 +3374,66 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!who':
+    case '!role': {
+      const args = text.replace(/^!\w+\s*/, '').trim().split(/\s+/).filter(Boolean);
+      const senderRole = getUserRole(sender);
+
+      if (args.length === 0 && cmd === '!role') {
+        await sendReply(`${sender}: ${senderRole}`);
+      } else if (cmd === '!who' || (args.length > 0 && args[0] === 'list')) {
+        if (senderRole !== 'admin') {
+          await sendReply('Only admins can list all roles.');
+          break;
+        }
+        const lines = [];
+        const allUsers = new Set([...ALLOWED_USER_IDS, ...roles.keys()]);
+        for (const uid of allUsers) {
+          const role = getUserRole(uid);
+          lines.push(`${uid}: ${role}`);
+        }
+        await sendReply(lines.length > 0 ? lines.join('\n') : 'No users configured.');
+      } else if (args.length === 2) {
+        if (senderRole !== 'admin') {
+          await sendReply('Only admins can assign roles.');
+          break;
+        }
+        const [targetUser, newRole] = args;
+        if (newRole !== 'admin' && newRole !== 'member') {
+          await sendReply('Role must be "admin" or "member".');
+          break;
+        }
+        if (!targetUser.startsWith('@') || !targetUser.includes(':')) {
+          await sendReply('User must be a full Matrix ID (e.g. @user:server).');
+          break;
+        }
+        if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(targetUser)) {
+          await sendReply('Cannot assign roles to users outside the allowlist.');
+          break;
+        }
+        if (newRole === 'member' && getUserRole(targetUser) === 'admin') {
+          const allowedAdmins = (ALLOWED_USER_IDS.length > 0 ? ALLOWED_USER_IDS : [...roles.keys()])
+            .filter(uid => getUserRole(uid) === 'admin');
+          if (allowedAdmins.length <= 1) {
+            await sendReply('Cannot demote the last admin.');
+            break;
+          }
+        }
+        const prevRole = roles.get(targetUser);
+        roles.set(targetUser, newRole);
+        if (!saveRoles()) {
+          if (prevRole) roles.set(targetUser, prevRole);
+          else roles.delete(targetUser);
+          await sendReply('Failed to save role — change rolled back.');
+          break;
+        }
+        await sendReply(`${targetUser} is now ${newRole}.`);
+      } else {
+        await sendReply('Usage: !role @user:server admin|member');
+      }
+      break;
+    }
+
     case '!status': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3483,7 +3599,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Info:\n` +
         `  !status — Session uptime, workdir, restarts\n` +
         `  !working — Toggle tool call visibility\n` +
-        `  !label [name] — Show or set server label for room names\n` +
+        `  !label [name] — Show or set server label\n` +
+        `  !role — Show your role, or !role @user admin|member (admin only)\n` +
+        `  !who — List all users and roles (admin only)\n` +
         `  !mcp — MCP server status\n` +
         `  !model — Current model\n` +
         `  !cost — Session cost\n` +
@@ -3523,6 +3641,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!status', 'Session uptime, workdir, restarts'],
           ['!working', 'Toggle tool call visibility'],
           ['!label [name]', 'Show or set server label'],
+          ['!role [@user admin|member]', 'Show or assign roles (admin only)'],
+          ['!who', 'List all users and roles (admin only)'],
           ['!mcp', 'MCP server status'],
           ['!model', 'Current model'],
           ['!cost', 'Session cost'],
@@ -3743,7 +3863,7 @@ client.on('room.message', async (roomId, event) => {
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
       'esc', 'escape', 'clearall', 'flush',
-      'label',
+      'label', 'role', 'who',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
