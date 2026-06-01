@@ -2948,6 +2948,38 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!esc':
+    case '!escape': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session.');
+        break;
+      }
+      try {
+        if (session.iv) {
+          session.iv.sendKeystroke('esc');
+          if (session.busy) {
+            session.busy = false;
+            if (session.typingInterval) {
+              clearInterval(session.typingInterval);
+              session.typingInterval = null;
+              client.setTyping(session.roomId, false, 1000).catch(() => {});
+            }
+          }
+        } else if (session.proc?.stdin?.writable) {
+          const msg = JSON.stringify({
+            type: 'control_request',
+            request_id: randomUUID(),
+            request: { subtype: 'interrupt' },
+          }) + '\n';
+          session.proc.stdin.write(msg);
+        }
+      } catch { /* ignore */ }
+      session._interrupted = true;
+      await sendReply('⎋ Interrupt sent — waiting for current turn to cancel.');
+      break;
+    }
+
     case '!stop': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3399,32 +3431,36 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!help': {
       const plainHelp =
-        `Available commands:\n\n` +
-        `/start — Start a new session (creates a new room)\n` +
-        `/start <workdir> — Start in a specific directory\n` +
-        `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
-        `/start --worktree <name> — Start in an isolated git worktree (branch: worktree-<name>)\n` +
-        `/stop — Stop the current session\n` +
-        `/restart — Stop and immediately resume the session (--browser, --worktree also accepted)\n` +
-        `/resume <n> — Resume session #n from /sessions list\n` +
-        `/resume <id> — Resume session by ID prefix (--browser also accepted)\n` +
-        `/sessions — List all past sessions\n` +
-        `/workdir <path> — Start session in a different directory (--browser also accepted)\n` +
-        `/status — Show current session info\n` +
-        `/working — Toggle tool call visibility\n` +
-        `/mcp — Show MCP server status\n` +
-        `/model — Show current model\n` +
-        `/cost — Show session cost\n` +
-        `/usage — Show token usage\n` +
-        `/tools — List available tools\n` +
-        `/help — Show this help message\n\n` +
-        `Each /start, /resume, and /workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room for the session.\n` +
+        `Bridge commands (use ! prefix):\n\n` +
+        `Sessions:\n` +
+        `  !start — Start a new session (creates a new room)\n` +
+        `  !start <workdir> — Start in a specific directory\n` +
+        `  !start --browser [workdir] — Add chrome-devtools MCP (~400M)\n` +
+        `  !start --worktree <name> — Isolated git worktree (branch: worktree-<name>)\n` +
+        `  !esc — Interrupt current turn (jumps the queue)\n` +
+        `  !stop — Stop the current session\n` +
+        `  !restart — Stop and resume (--browser, --worktree accepted)\n` +
+        `  !resume <n|id> — Resume session by number or ID (--browser accepted)\n` +
+        `  !sessions — List all past sessions\n` +
+        `  !workdir <path> — Change directory and restart (--browser accepted)\n\n` +
+        `Info:\n` +
+        `  !status — Session uptime, workdir, restarts\n` +
+        `  !working — Toggle tool call visibility\n` +
+        `  !mcp — MCP server status\n` +
+        `  !model — Current model\n` +
+        `  !cost — Session cost\n` +
+        `  !usage — Token usage\n` +
+        `  !tools — Available tools\n` +
+        `  !help — This help message\n\n` +
+        `Use ! for bridge commands. / also works for the above, but\n` +
+        `unrecognized / commands are forwarded to Claude Code CLI.\n\n` +
+        `Each !start, !resume, and !workdir creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room.\n` +
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
-        `  Send "send" to flush the queue\n` +
-        `  Send "interrupt" or "escape" to cancel the current turn (like Escape in terminal)\n\n` +
-        `Send any other text to chat with Claude Code.\n` +
+        `  "send" or "interrupt" to flush the queue now\n` +
+        `  !esc to cancel the current turn (never queued)\n` +
+        `  "cancel" to drop last queued message\n\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
       const cmdGroup = (title, cmds) => {
@@ -3434,31 +3470,32 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const htmlHelp =
         cmdGroup('Sessions', [
-          ['/start', 'Start a new session (creates a new room)'],
-          ['/start &lt;workdir&gt;', 'Start in a specific directory'],
-          ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
-          ['/stop', 'Stop the current session'],
-          ['/restart', 'Stop and immediately resume the session (--browser also accepted)'],
-          ['/resume &lt;n&gt;', 'Resume session #n from /sessions list'],
-          ['/resume &lt;id&gt;', 'Resume session by ID prefix (--browser also accepted)'],
-          ['/sessions', 'List all past sessions'],
-          ['/workdir &lt;path&gt;', 'Start session in a different directory (--browser also accepted)'],
+          ['!start', 'Start a new session (creates a new room)'],
+          ['!start &lt;workdir&gt;', 'Start in a specific directory'],
+          ['!start --browser [workdir]', 'Also enable chrome-devtools MCP (~400M)'],
+          ['!esc', 'Interrupt current turn (jumps the queue)'],
+          ['!stop', 'Stop the current session'],
+          ['!restart', 'Stop and resume (--browser accepted)'],
+          ['!resume &lt;n|id&gt;', 'Resume session by number or ID (--browser accepted)'],
+          ['!sessions', 'List all past sessions'],
+          ['!workdir &lt;path&gt;', 'Change directory and restart (--browser accepted)'],
         ]) +
         cmdGroup('Info', [
-          ['/status', 'Show current session info'],
-          ['/working', 'Toggle tool call visibility'],
-          ['/mcp', 'Show MCP server status'],
-          ['/model', 'Show current model'],
-          ['/cost', 'Show session cost'],
-          ['/usage', 'Show token usage'],
-          ['/tools', 'List available tools'],
-          ['/help', 'Show this help message'],
+          ['!status', 'Session uptime, workdir, restarts'],
+          ['!working', 'Toggle tool call visibility'],
+          ['!mcp', 'MCP server status'],
+          ['!model', 'Current model'],
+          ['!cost', 'Session cost'],
+          ['!usage', 'Token usage'],
+          ['!tools', 'Available tools'],
+          ['!help', 'This help message'],
         ]) +
         `<b>Tips</b><ul>` +
-        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
+        `<li>Use <code>!</code> for bridge commands. <code>/</code> also works for the above, but unrecognized <code>/</code> commands forward to Claude Code CLI.</li>` +
+        `<li>Each <code>!start</code>, <code>!resume</code>, and <code>!workdir</code> creates a new ${ENCRYPT_SESSION_ROOMS ? 'encrypted ' : ''}room</li>` +
         `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
         `<li>Messages are queued automatically while Claude is working</li>` +
-        `<li>Send <code>interrupt</code> to force interrupt</li>` +
+        `<li><code>send</code>/<code>interrupt</code> flush the queue; <code>!esc</code> cancels the turn; <code>cancel</code> drops last queued message</li>` +
         `<li>You can send photos and documents (PDFs, images, text files)</li>` +
         `</ul>`;
 
@@ -3665,6 +3702,7 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
+      'esc', 'escape',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
@@ -3926,7 +3964,25 @@ client.on('room.message', async (roomId, event) => {
   }
   if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
-    if (lowerText === 'send') {
+    if (lowerText === '!esc' || lowerText === '!escape') {
+      try {
+        if (session.iv) {
+          session.iv.sendKeystroke('esc');
+        } else if (session.proc?.stdin?.writable) {
+          const msg = JSON.stringify({
+            type: 'control_request',
+            request_id: randomUUID(),
+            request: { subtype: 'interrupt' },
+          }) + '\n';
+          session.proc.stdin.write(msg);
+        }
+      } catch { /* ignore */ }
+      session._interrupted = true;
+      clearBusyAfterEsc(session);
+      await sendReply('⎋ Interrupt sent — waiting for current turn to cancel.');
+      return;
+    }
+    if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
       stripQueueNotificationLinks(session);
