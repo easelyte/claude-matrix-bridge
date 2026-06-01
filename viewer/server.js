@@ -270,7 +270,7 @@ app.get('/download', async (req, res) => {
     const content = await result.fh.readFile();
     await result.fh.close();
     const filename = path.basename(result.filePath);
-    const safeFilename = escapeHtml(filename).replace(/"/g, '\\"');
+    const safeFilename = filename.replace(/[\\"\r\n]/g, '_');
     res.set('Content-Disposition', `attachment; filename="${safeFilename}"`);
     res.type('application/octet-stream').send(content);
   } catch (err) {
