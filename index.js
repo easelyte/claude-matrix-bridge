@@ -2421,6 +2421,13 @@ function sessionEffectiveCwd(session) {
   return session.workdir;
 }
 
+function uploadsDir(session) {
+  const base = sessionEffectiveCwd(session);
+  const dir = path.join(base, 'uploads');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function deduplicateFilename(dir, filename) {
   let target = path.join(dir, filename);
   if (!fs.existsSync(target)) return target;
@@ -2878,7 +2885,7 @@ async function buildMediaContentBlocks(event, session) {
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
   } else if (content.msgtype === 'm.image') {
     let imgPath;
-    try { imgPath = deduplicateFilename(sessionEffectiveCwd(session), fileName); }
+    try { imgPath = deduplicateFilename(uploadsDir(session), fileName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return blocks; }
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
@@ -2888,7 +2895,7 @@ async function buildMediaContentBlocks(event, session) {
     });
   } else {
     let savePath;
-    try { savePath = deduplicateFilename(sessionEffectiveCwd(session), fileName); }
+    try { savePath = deduplicateFilename(uploadsDir(session), fileName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return blocks; }
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
