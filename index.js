@@ -2980,6 +2980,26 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!clearall':
+    case '!flush': {
+      const session = sessions.get(roomId);
+      if (!session) {
+        await sendReply('No active session.');
+        break;
+      }
+      const queue = session.queuedMessages || [];
+      const notifs = session.queueNotifications || [];
+      session.queuedMessages = null;
+      session.queueNotifications = [];
+      for (const { eventId, plain } of notifs) {
+        if (eventId) editMessage(session.roomId, eventId, `✕ ${plain} (flushed)`);
+      }
+      await sendReply(queue.length > 0
+        ? `🗑 Dropped ${queue.length} queued message${queue.length > 1 ? 's' : ''}.`
+        : 'No queued messages to drop.');
+      break;
+    }
+
     case '!stop': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3438,6 +3458,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !start --browser [workdir] — Add chrome-devtools MCP (~400M)\n` +
         `  !start --worktree <name> — Isolated git worktree (branch: worktree-<name>)\n` +
         `  !esc — Interrupt current turn (jumps the queue)\n` +
+        `  !flush — Drop all queued messages\n` +
         `  !stop — Stop the current session\n` +
         `  !restart — Stop and resume (--browser, --worktree accepted)\n` +
         `  !resume <n|id> — Resume session by number or ID (--browser accepted)\n` +
@@ -3474,6 +3495,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!start &lt;workdir&gt;', 'Start in a specific directory'],
           ['!start --browser [workdir]', 'Also enable chrome-devtools MCP (~400M)'],
           ['!esc', 'Interrupt current turn (jumps the queue)'],
+          ['!clearall', 'Drop all queued messages'],
           ['!stop', 'Stop the current session'],
           ['!restart', 'Stop and resume (--browser accepted)'],
           ['!resume &lt;n|id&gt;', 'Resume session by number or ID (--browser accepted)'],
@@ -3702,7 +3724,7 @@ client.on('room.message', async (roomId, event) => {
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
-      'esc', 'escape',
+      'esc', 'escape', 'clearall', 'flush',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
