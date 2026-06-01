@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
@@ -47,6 +47,7 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
+function encodeProjectDir(p) { return p.replace(/[/.]/g, '-'); }
 const MATRIX_EVENT_NAMESPACE = 'chat.matron';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const COMMAND_EVENT_TYPES = [`${MATRIX_EVENT_NAMESPACE}.commands`];
@@ -181,6 +182,14 @@ function debug(...args) {
   if (DEBUG) console.log('[DEBUG]', ...args);
 }
 
+const BRIDGE_PERMISSIONS = {
+  allow: [
+    'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)',
+    'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)',
+    'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)',
+  ],
+  deny: [],
+};
 // --- Session Persistence ---
 
 const LAST_EVENT_TS_FILE = path.join(os.homedir(), '.claude-matrix-bot-last-event-ts');
@@ -239,6 +248,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   const live = sessions.get(roomId);
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  if (live && live.worktree) derived.worktree = live.worktree;
   data[String(roomId)] = {
     ...existing,
     ...derived,
@@ -259,6 +269,14 @@ function getPersistedSession(roomId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
+
+function isWorktreeInUse(worktreeName, workdir, excludeRoomId) {
+  for (const [rid, s] of sessions) {
+    if (rid === excludeRoomId) continue;
+    if (s.alive && s.worktree === worktreeName && s.workdir === workdir) return true;
+  }
+  return false;
+}
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (INTERACTIVE_MODE) {
@@ -283,12 +301,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
-    '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify({
+      permissions: BRIDGE_PERMISSIONS,
       hooks: {
         PreCompact: [{
           hooks: [{
@@ -309,6 +327,16 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   ];
   if (resumeSessionId) {
     args.push('--resume', resumeSessionId);
+  }
+
+  // --worktree <name>: spawn Claude in an isolated git worktree. Claude
+  // handles creation (`.claude/worktrees/<name>`) and branch management
+  // (`worktree-<name>`). Useful for parallel sessions that shouldn't
+  // share filesystem state. Explicit option wins; fall back to persisted
+  // value so resume/restart/auto-resume preserve isolation.
+  const worktreeName = options.worktree || persistedForRoom?.worktree || null;
+  if (worktreeName) {
+    args.push('--worktree', worktreeName);
   }
 
   debug(`Spawning claude with args: ${args.join(' ')}`);
@@ -344,6 +372,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
+    worktree: worktreeName,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -427,11 +456,21 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        // Don't auto-restart if the workdir or worktree was removed (e.g.
+        // worktree cleaned up after merge). The session is legitimately over.
+        const cwdGone = !fs.existsSync(cwd);
+        const wtGone = session.worktree && !fs.existsSync(path.join(cwd, '.claude', 'worktrees', session.worktree));
+        if (cwdGone || wtGone) {
+          sessions.delete(roomId);
+          const notice = '▌ Session workdir no longer exists (worktree removed after merge?). Use !start to begin a new session.';
+          if (session.sendCallback) session.sendCallback(notice);
+          return;
+        }
         // Pass mcpExtras explicitly: createSession can fall back to persisted
         // state, but a print-mode session that crashes before its session_id
         // is delivered hasn't been persisted yet, and would silently respawn
         // without the user's --browser opt-in.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras, worktree: session.worktree });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -473,7 +512,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // the parent's stream emits a Task tool_use. The watcher object is cheap
   // to construct; it doesn't poll until the first Task fires.
   if (session.claudeSessionId) {
-    session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId: session.claudeSessionId });
+    session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId: session.claudeSessionId, worktreeName: session.worktree });
     session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
     session.subagentWatcher.snapshot();
   }
@@ -499,6 +538,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const sessionId = resumeSessionId || randomUUID();
 
   const settings = {
+    permissions: {
+      allow: [
+        'Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)',
+        'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)',
+      ],
+      deny: [],
+    },
     hooks: {
       PreCompact: [{
         hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
@@ -527,8 +573,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   } else {
     claudeArgs.push('--session-id', sessionId);
   }
+  const worktreeName = options.worktree || persistedForRoom?.worktree || null;
   claudeArgs.push(
-    '--dangerously-skip-permissions',
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
@@ -537,18 +583,27 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify(settings),
   );
+  if (worktreeName) {
+    claudeArgs.push('--worktree', worktreeName);
+  }
 
   const nodeBinDir = path.dirname(process.execPath);
   const existingPath = process.env.PATH || '';
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
-  debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
+  const encodedCwd = encodeProjectDir(cwd);
+  const worktreeTranscriptPath = worktreeName
+    ? path.join(os.homedir(), '.claude', 'projects', `${encodedCwd}--claude-worktrees-${worktreeName}`, `${sessionId}.jsonl`)
+    : undefined;
+
+  debug(`Spawning interactive claude session ${sessionId} in ${cwd}${worktreeName ? ` (worktree: ${worktreeName})` : ''}`);
 
   const iv = createInteractiveSession({
     roomId,
     workdir: cwd,
     sessionId,
     claudeArgs,
+    transcriptPath: worktreeTranscriptPath,
     env: {
       ...process.env,
       PATH: pathWithNode,
@@ -568,6 +623,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
+    worktree: worktreeName,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -596,7 +652,32 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pinnedSummaryText: '',
     pendingWelcome: true,
     pendingInteractivePrompt: null,
+    ivReady: false,
+    ivPendingInput: null,
   };
+
+  function markIvReady() {
+    if (session.ivReady) return;
+    session.ivReady = true;
+    debug(`[IV] Session marked ready, pending input: ${!!session.ivPendingInput}`);
+    if (session.ivPendingInput) {
+      const pending = session.ivPendingInput;
+      session.ivPendingInput = null;
+      sendToSession(session, pending);
+    }
+  }
+
+  let _ivPtyBuf = '';
+  iv.on('pty-data', chunk => {
+    if (session.ivReady) return;
+    _ivPtyBuf += chunk;
+    if (_ivPtyBuf.length > 4096) _ivPtyBuf = _ivPtyBuf.slice(-2048);
+    if (_ivPtyBuf.includes('/effort')) {
+      debug('[IV] Detected toolbar in PTY output — TUI is ready');
+      _ivPtyBuf = '';
+      markIvReady();
+    }
+  });
 
   iv.on('event', event => {
     debug('IV event:', event.type);
@@ -610,6 +691,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
+    markIvReady();
     session.pendingInteractivePrompt = prompt;
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
@@ -650,10 +732,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+        const cwdGone = !fs.existsSync(cwd);
+        const wtGone = session.worktree && !fs.existsSync(path.join(cwd, '.claude', 'worktrees', session.worktree));
+        if (cwdGone || wtGone) {
+          sessions.delete(roomId);
+          const notice = '▌ Session workdir no longer exists (worktree removed after merge?). Use !start to begin a new session.';
+          if (session.sendCallback) session.sendCallback(notice);
+          return;
+        }
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras, worktree: session.worktree });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -755,8 +845,16 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
   };
 
+  const readyTimer = setTimeout(() => {
+    if (!session.ivReady) {
+      debug('[IV] Readiness timeout (30s) — forcing ready');
+      markIvReady();
+    }
+  }, 30000);
+  if (typeof readyTimer.unref === 'function') readyTimer.unref();
+
   // Subagent activity watcher — see createSession() for the rationale.
-  session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId });
+  session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId, worktreeName });
   session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
   session.subagentWatcher.snapshot();
 
@@ -1368,7 +1466,7 @@ function handleClaudeEvent(session, event) {
   // watcher up front. Decoupled from the id-capture block above so future
   // refactors can't silently lose the watcher on either spawn path.
   if (session.claudeSessionId && !session.subagentWatcher) {
-    session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId });
+    session.subagentWatcher = new SubagentWatcher({ workdir: session.workdir, sessionId: session.claudeSessionId, worktreeName: session.worktree });
     session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
     session.subagentWatcher.snapshot();
   }
@@ -1383,6 +1481,11 @@ function handleClaudeEvent(session, event) {
 
   switch (event.type) {
     case 'assistant': {
+      // Cancel Enter retry — the turn started successfully
+      if (session._enterRetryTimer) {
+        clearTimeout(session._enterRetryTimer);
+        session._enterRetryTimer = null;
+      }
       const content = event.message?.content;
       if (!Array.isArray(content)) break;
 
@@ -1877,6 +1980,33 @@ function flushResponse(session) {
   session.lastActivityAt = Date.now();
 }
 
+function clearBusyAfterEsc(session) {
+  session.busy = false;
+  if (session.typingInterval) {
+    clearInterval(session.typingInterval);
+    session.typingInterval = null;
+    client.setTyping(session.roomId, false, 1000).catch(() => {});
+  }
+  // Safety net: Esc-cancelled turns don't fire the Stop hook, so onTurnEnd
+  // never runs. If something re-sets busy during the cancellation wind-down
+  // (e.g. a late transcript event processed between now and the TUI returning
+  // to the input prompt), re-clear after a delay. The 2s window covers the
+  // typical Esc → input-prompt transition.
+  if (session._escBusyTimer) clearTimeout(session._escBusyTimer);
+  session._escBusyTimer = setTimeout(() => {
+    session._escBusyTimer = null;
+    if (session.busy && session.alive) {
+      debug('[ESC] Safety timer: re-clearing busy after Esc cancellation');
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+    }
+  }, 2000);
+}
+
 function sendToSession(session, contentBlocks) {
   if (!session.alive || session._autoStopped) return false;
 
@@ -1900,7 +2030,38 @@ function sendToSession(session, contentBlocks) {
     }
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
+      // Gate on TUI readiness: the PTY swallows Enter keystrokes during
+      // the resume/init window (before the toolbar renders). Stash the
+      // content blocks and let markIvReady() call sendToSession() once
+      // the TUI is actually ready to accept input.
+      if (!session.ivReady) {
+        debug('[IV] TUI not ready — stashing input for deferred send');
+        session.ivPendingInput = contentBlocks;
+        if (session.resetTimeout) session.resetTimeout();
+        return true;
+      }
       session.iv.sendText(text);
+      // Enter retry: after sending text, the 500ms delayed Enter may be
+      // swallowed if the TUI has a transient hiccup. Watch for transcript
+      // activity — if none arrives within 3s, retry Enter. Up to 2 retries.
+      let retries = 0;
+      const maxRetries = 2;
+      const retryMs = 3000;
+      function scheduleRetry() {
+        if (retries >= maxRetries) return;
+        session._enterRetryTimer = setTimeout(() => {
+          session._enterRetryTimer = null;
+          if (!session.alive || !session.iv?.alive) return;
+          if (!session.busy) return;
+          if (session.responseBuffer.trim()) return;
+          retries++;
+          debug(`[IV] Enter retry ${retries}/${maxRetries} — no response after ${retryMs}ms`);
+          session.iv.sendKeystroke('enter');
+          scheduleRetry();
+        }, retryMs);
+        if (typeof session._enterRetryTimer.unref === 'function') session._enterRetryTimer.unref();
+      }
+      scheduleRetry();
       if (session.resetTimeout) session.resetTimeout();
       return true;
     }
@@ -2210,6 +2371,15 @@ function plainTextFormat(text) {
 }
 
 // --- File Helpers ---
+
+function sessionEffectiveCwd(session) {
+  if (session.worktree) {
+    const wtPath = path.join(session.workdir, '.claude', 'worktrees', session.worktree);
+    if (fs.existsSync(wtPath)) return wtPath;
+    throw new Error(`Worktree directory not found: ${wtPath}`);
+  }
+  return session.workdir;
+}
 
 function deduplicateFilename(dir, filename) {
   let target = path.join(dir, filename);
@@ -2550,7 +2720,7 @@ async function maybeUpdatePinnedSummary(session) {
 }
 
 function getSessionSummary(sessionId, workdir) {
-  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
+  const encodedPath = encodeProjectDir(workdir || DEFAULT_WORKDIR);
   const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
   try {
     const content = fs.readFileSync(filePath, 'utf-8');
@@ -2578,29 +2748,33 @@ function getSessionSummary(sessionId, workdir) {
  * Check if the session's JSONL history already contains a tool_result for the given tool_use_id.
  * This prevents sending duplicate tool_results which cause API 400 errors.
  */
-function hasToolResultInHistory(sessionId, workdir, toolUseId) {
-  const encodedPath = (workdir || DEFAULT_WORKDIR).replace(/\//g, '-');
-  const filePath = path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
-  try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const lines = content.split('\n');
-    // Scan from end (most recent) for efficiency
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      // Quick string check before parsing JSON
-      if (!line.includes(toolUseId)) continue;
-      let record;
-      try { record = JSON.parse(line); } catch { continue; }
-      if (record.type === 'user' && Array.isArray(record.message?.content)) {
-        for (const block of record.message.content) {
-          if (block.type === 'tool_result' && block.tool_use_id === toolUseId) {
-            return true;
+function hasToolResultInHistory(sessionId, workdir, toolUseId, worktreeName) {
+  const encodedPath = encodeProjectDir(workdir || DEFAULT_WORKDIR);
+  // Check both base workdir and worktree transcript paths
+  const candidates = [path.join(os.homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)];
+  if (worktreeName) {
+    candidates.push(path.join(os.homedir(), '.claude', 'projects', `${encodedPath}--claude-worktrees-${worktreeName}`, `${sessionId}.jsonl`));
+  }
+  for (const filePath of candidates) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const lines = content.split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        if (!line.includes(toolUseId)) continue;
+        let record;
+        try { record = JSON.parse(line); } catch { continue; }
+        if (record.type === 'user' && Array.isArray(record.message?.content)) {
+          for (const block of record.message.content) {
+            if (block.type === 'tool_result' && block.tool_use_id === toolUseId) {
+              return true;
+            }
           }
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
   return false;
 }
 
@@ -2646,8 +2820,9 @@ async function buildMediaContentBlocks(event, session) {
     const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
   } else if (content.msgtype === 'm.image') {
-    // Save image to workdir
-    const imgPath = deduplicateFilename(session.workdir, fileName);
+    let imgPath;
+    try { imgPath = deduplicateFilename(sessionEffectiveCwd(session), fileName); }
+    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return blocks; }
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
@@ -2655,8 +2830,9 @@ async function buildMediaContentBlocks(event, session) {
       source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
     });
   } else {
-    // Save file to workdir
-    const savePath = deduplicateFilename(session.workdir, fileName);
+    let savePath;
+    try { savePath = deduplicateFilename(sessionEffectiveCwd(session), fileName); }
+    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return blocks; }
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
 
@@ -2698,7 +2874,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: positional } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(parts.slice(1));
+      const { worktree, error: worktreeError, rest: positional } = extractWorktreeFlag(afterExtras);
+      if (worktreeError) {
+        await sendReply(worktreeError);
+        return;
+      }
       const arg = positional[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
@@ -2718,6 +2899,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         workdir = resolved;
       }
 
+      // Reject --worktree in interactive mode before creating a room
+      if (worktree && INTERACTIVE_MODE) {
+        await sendReply('--worktree is not yet supported in interactive mode. Use print mode (MATRON_INTERACTIVE_MODE=0) for worktree sessions.');
+        return;
+      }
+
+      // Check for duplicate worktree before creating a room (room creation is irreversible)
+      if (worktree && isWorktreeInUse(worktree, workdir)) {
+        await sendReply(`Worktree "${worktree}" is already in use by another session. Pick a different name.`);
+        return;
+      }
+
       // Create a new room for this session
       let sessionRoomId;
       try {
@@ -2732,8 +2925,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
-
-      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
+      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras, worktree });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -2742,14 +2934,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // now — otherwise a bridge restart before the first transcript-driven
       // persist would lose the user's opt-in. Print-mode sessions get their
       // claudeSessionId asynchronously and pick this up on the first persist.
-      if (mcpExtras.length > 0 && session.claudeSessionId) {
+      if ((mcpExtras.length > 0 || worktree) && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
       // Confirm in origin room with a link to the new room
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
-      await sendReply(`Session started in new room: ${roomLink}${extrasNote}`);
+      const worktreeNote = worktree ? ` (worktree: ${worktree})` : '';
+      await sendReply(`Session started in new room: ${roomLink}${extrasNote}${worktreeNote}`);
 
       // Welcome message will be sent when user joins (see room.join handler)
       break;
@@ -2786,7 +2979,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // session ID. Passing no flags preserves whatever extras the session
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
-      const { extras: restartFlagExtras } = extractMcpExtraFlags(parts.slice(1));
+      const { extras: restartFlagExtras, rest: restartRest } = extractMcpExtraFlags(parts.slice(1));
+      const { worktree: restartWorktree, error: restartWtError } = extractWorktreeFlag(restartRest);
+      if (restartWtError) {
+        await sendReply(restartWtError);
+        return;
+      }
+      const effectiveWorktree = restartWorktree || existing.worktree || null;
+      if (effectiveWorktree && INTERACTIVE_MODE) {
+        await sendReply('--worktree is not yet supported in interactive mode.');
+        return;
+      }
+      if (effectiveWorktree && isWorktreeInUse(effectiveWorktree, existing.workdir, roomId)) {
+        await sendReply(`Worktree "${effectiveWorktree}" is already in use by another session.`);
+        return;
+      }
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
       const effectiveRestartExtras = restartFlagExtras.length > 0
         ? restartFlagExtras
@@ -2796,7 +3003,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       sessions.delete(roomId);
       killSession(existing);
       await sendReply('🔄 Restarting session...');
-      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras });
+      const restarted = createSession(roomId, restartWorkdir, restartSessionId, { mcpExtras: effectiveRestartExtras, worktree: effectiveWorktree });
       restarted.sendCallback = sendReply;
       restarted.sendHtml = sendHtml;
       restarted.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
@@ -2834,30 +3041,50 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const currentSession = sessions.get(roomId);
       const prev = getPersistedSession(roomId);
       const resumeWorkdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
-      const encodedPath = resumeWorkdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+      const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+      const encodedPath = encodeProjectDir(resumeWorkdir);
 
-      if (!fs.existsSync(projectDir)) {
-        await sendReply(`No sessions directory found for workdir: ${resumeWorkdir}`);
+      const projectDir = path.join(projectsRoot, encodedPath);
+
+      // Build session list from base workdir + persisted worktree sessions
+      const resumeFiles = [];
+      const seenResumeIds = new Set();
+      try {
+        for (const f of fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'))) {
+          const sid = f.replace('.jsonl', '');
+          const stat = fs.statSync(path.join(projectDir, f));
+          resumeFiles.push({ sid, mtimeMs: stat.mtimeMs });
+          seenResumeIds.add(sid);
+        }
+      } catch { /* dir doesn't exist */ }
+      const allPersistedForResume = loadPersistedSessions();
+      for (const entry of Object.values(allPersistedForResume)) {
+        if (!entry.sessionId || seenResumeIds.has(entry.sessionId)) continue;
+        if (!entry.worktree) continue;
+        if (entry.workdir && entry.workdir !== resumeWorkdir) continue;
+        const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
+        const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
+        let mtimeMs = entry.lastUsed || Date.now();
+        try { mtimeMs = fs.statSync(wtPath).mtimeMs; } catch { /* short session, no transcript yet */ }
+        resumeFiles.push({ sid: entry.sessionId, mtimeMs });
+        seenResumeIds.add(entry.sessionId);
+      }
+
+      if (resumeFiles.length === 0) {
+        await sendReply(`No sessions found for workdir: ${resumeWorkdir}`);
         return;
       }
 
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => f.replace('.jsonl', ''))
-        .sort((a, b) => {
-          const sa = fs.statSync(path.join(projectDir, a + '.jsonl'));
-          const sb = fs.statSync(path.join(projectDir, b + '.jsonl'));
-          return sb.mtimeMs - sa.mtimeMs;
-        });
+      resumeFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      const sortedFiles = resumeFiles.map(f => f.sid);
 
       let resumeSessionId;
       let actualWorkdir = resumeWorkdir;
       const num = /^\d+$/.test(resumeArg) ? parseInt(resumeArg, 10) : NaN;
-      if (!isNaN(num) && num >= 1 && num <= files.length) {
-        resumeSessionId = files[num - 1];
+      if (!isNaN(num) && num >= 1 && num <= sortedFiles.length) {
+        resumeSessionId = sortedFiles[num - 1];
       } else {
-        const match = files.find(f => f.startsWith(resumeArg));
+        const match = sortedFiles.find(f => f.startsWith(resumeArg));
         if (match) {
           resumeSessionId = match;
         } else {
@@ -2871,10 +3098,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             }
           }
           if (foundEntry) {
-            const altEncoded = foundEntry.workdir.replace(/\//g, '-');
+            const altEncoded = encodeProjectDir(foundEntry.workdir);
+            // Check base transcript path, then worktree transcript path
             const altDir = path.join(os.homedir(), '.claude', 'projects', altEncoded);
             const altFile = path.join(altDir, `${foundEntry.sessionId}.jsonl`);
-            if (fs.existsSync(altFile)) {
+            const wtDir = foundEntry.worktree
+              ? path.join(os.homedir(), '.claude', 'projects', `${altEncoded}--claude-worktrees-${foundEntry.worktree}`)
+              : null;
+            const wtFile = wtDir ? path.join(wtDir, `${foundEntry.sessionId}.jsonl`) : null;
+            if (fs.existsSync(altFile) || (wtFile && fs.existsSync(wtFile))) {
               resumeSessionId = foundEntry.sessionId;
               actualWorkdir = foundEntry.workdir;
             }
@@ -2893,6 +3125,20 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           await sendReply(`Session ${resumeSessionId.slice(0, 8)}… is already active: ${roomLink}`);
           return;
         }
+      }
+
+      // Validate worktree constraints before creating a room (room creation is irreversible)
+      const resumePersisted = (resumeSessionId
+        ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
+        : null);
+      const effectiveResumeWorktree = resumePersisted?.worktree || null;
+      if (effectiveResumeWorktree && INTERACTIVE_MODE) {
+        await sendReply('Cannot resume a worktree session in interactive mode.');
+        return;
+      }
+      if (effectiveResumeWorktree && isWorktreeInUse(effectiveResumeWorktree, actualWorkdir)) {
+        await sendReply(`Worktree "${effectiveResumeWorktree}" is already in use by another session.`);
+        return;
       }
 
       // Create a new room for the resumed session
@@ -2917,16 +3163,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      // Inherit the resumed session's previously persisted extras unless the
-      // user is explicitly overriding via the command line; this lets a
-      // resume "just work" if /start --browser was used originally.
-      const resumePersisted = getPersistedSession(sessionRoomId) || (resumeSessionId
-        ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
-        : null);
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
         : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
-      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras });
+      const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras, worktree: effectiveResumeWorktree });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
       session.sendCallback = sessionSendReply;
@@ -3020,17 +3260,22 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const shortId = session.claudeSessionId ? session.claudeSessionId.slice(0, 8) + '…' : '(pending)';
       const busyText = session.busy ? 'yes' : 'no';
 
+      const worktreeText = session.worktree ? `\nWorktree: ${session.worktree}` : '';
       const plainStatus =
-        `Session active\nWorkdir: ${session.workdir}\nSession ID: ${shortId}\n` +
+        `Session active\nWorkdir: ${session.workdir}${worktreeText}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}`;
 
       const busyHtml = session.busy
         ? color('● busy', '#f0883e')
         : color('● idle', '#3fb950');
+      const worktreeRow = session.worktree
+        ? `<tr><td>Worktree</td><td><code>${escapeHtml(session.worktree)}</code></td></tr>`
+        : '';
       const htmlStatus =
         `<b>Session Status</b><table>` +
         `<tr><td>State</td><td>${busyHtml}</td></tr>` +
         `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
+        worktreeRow +
         `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
         `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
         `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
@@ -3079,24 +3324,43 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const prev = getPersistedSession(roomId);
       const workdir = currentSession?.workdir || prev?.workdir || DEFAULT_WORKDIR;
 
-      const encodedPath = workdir.replace(/\//g, '-');
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', encodedPath);
+      // Scan the base workdir project dir for transcripts, then augment
+      // with persisted sessions (which include worktree sessions that
+      // have transcripts in different project dirs).
+      const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+      const encodedPath = encodeProjectDir(workdir);
+      const projectDir = path.join(projectsRoot, encodedPath);
 
-      if (!fs.existsSync(projectDir)) {
-        await sendReply('No sessions found for this workdir.');
-        break;
-      }
-
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => {
+      const files = [];
+      const seenIds = new Set();
+      // 1. Scan base workdir transcripts
+      try {
+        for (const f of fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'))) {
           const sessionId = f.replace('.jsonl', '');
-          const filePath = path.join(projectDir, f);
-          const stat = fs.statSync(filePath);
+          const stat = fs.statSync(path.join(projectDir, f));
           const summary = getSessionSummary(sessionId, workdir);
-          return { sessionId, modified: stat.mtimeMs, summary };
-        })
-        .sort((a, b) => b.modified - a.modified);
+          files.push({ sessionId, modified: stat.mtimeMs, summary });
+          seenIds.add(sessionId);
+        }
+      } catch { /* dir doesn't exist */ }
+      // 2. Add persisted worktree sessions whose transcripts live elsewhere
+      const allPersisted = loadPersistedSessions();
+      for (const entry of Object.values(allPersisted)) {
+        if (!entry.sessionId || seenIds.has(entry.sessionId)) continue;
+        if (!entry.worktree) continue;
+        if (entry.workdir && entry.workdir !== workdir) continue;
+        // Find the transcript in the worktree project dir
+        const wtEncoded = `${encodedPath}--claude-worktrees-${entry.worktree}`;
+        const wtPath = path.join(projectsRoot, wtEncoded, `${entry.sessionId}.jsonl`);
+        let modified = entry.lastUsed || Date.now();
+        try {
+          modified = fs.statSync(wtPath).mtimeMs;
+        } catch { /* transcript may not exist yet for short sessions */ }
+        const summary = getSessionSummary(entry.sessionId, workdir) || `[worktree: ${entry.worktree}]`;
+        files.push({ sessionId: entry.sessionId, modified, summary, worktree: entry.worktree });
+        seenIds.add(entry.sessionId);
+      }
+      files.sort((a, b) => b.modified - a.modified);
 
       if (files.length === 0) {
         await sendReply('No sessions found.');
@@ -3139,8 +3403,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start — Start a new session (creates a new room)\n` +
         `/start <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
+        `/start --worktree <name> — Start in an isolated git worktree (branch: worktree-<name>)\n` +
         `/stop — Stop the current session\n` +
-        `/restart — Stop and immediately resume the session (--browser also accepted)\n` +
+        `/restart — Stop and immediately resume the session (--browser, --worktree also accepted)\n` +
         `/resume <n> — Resume session #n from /sessions list\n` +
         `/resume <id> — Resume session by ID prefix (--browser also accepted)\n` +
         `/sessions — List all past sessions\n` +
@@ -3157,7 +3422,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
         `While Claude is working:\n` +
         `  Messages are queued automatically\n` +
-        `  Send "interrupt" to force interrupt\n\n` +
+        `  Send "send" to flush the queue\n` +
+        `  Send "interrupt" or "escape" to cancel the current turn (like Escape in terminal)\n\n` +
         `Send any other text to chat with Claude Code.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
@@ -3535,7 +3801,7 @@ client.on('room.message', async (roomId, event) => {
     // Claude CLI auto-generates a tool_result for permission denials, so sending another
     // one causes a duplicate tool_result API 400 error.
     const alreadyAnswered = toolUseId && session.claudeSessionId
-      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId)
+      ? hasToolResultInHistory(session.claudeSessionId, session.workdir, toolUseId, session.worktree)
       : false;
     console.log(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
 
@@ -3650,17 +3916,7 @@ client.on('room.message', async (roomId, event) => {
     if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
       try {
         session.iv.sendKeystroke('esc');
-        // Clear bridge-side busy state since claude won't fire a Stop
-        // hook after a user-cancelled turn — leaving busy=true would
-        // queue every subsequent message.
-        if (session.busy) {
-          session.busy = false;
-          if (session.typingInterval) {
-            clearInterval(session.typingInterval);
-            session.typingInterval = null;
-            client.setTyping(session.roomId, false, 1000).catch(() => {});
-          }
-        }
+        clearBusyAfterEsc(session);
         await sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
         await sendReply(`Could not send Esc: ${err.message}`);
@@ -3670,7 +3926,7 @@ client.on('room.message', async (roomId, event) => {
   }
   if (session.busy && !isClaudeSlashCommand) {
     const lowerText = text.toLowerCase().trim();
-    if (lowerText === 'send' || lowerText === 'interrupt' || lowerText === '!interrupt') {
+    if (lowerText === 'send') {
       const queued = session.queuedMessages || [];
       session.queuedMessages = null;
       stripQueueNotificationLinks(session);
@@ -3687,6 +3943,16 @@ client.on('room.message', async (roomId, event) => {
       } else {
         await sendReply('⚡ No queued messages to send.');
       }
+      return;
+    }
+    if (lowerText === 'interrupt' || lowerText === '!interrupt' || lowerText === 'escape') {
+      try {
+        if (session.iv) session.iv.sendKeystroke('esc');
+        else if (session.proc) session.proc.kill('SIGINT');
+      } catch (e) { debug(`interrupt signal error: ${e.message}`); }
+      session._interrupted = true;
+      if (session.iv) clearBusyAfterEsc(session);
+      await sendReply('⚡ Interrupt sent — waiting for current turn to cancel.');
       return;
     }
     if (lowerText === 'cancel') {
@@ -4434,6 +4700,8 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
 
 function killSession(session, signal = 'SIGTERM') {
   if (!session) return;
+  if (session._enterRetryTimer) { clearTimeout(session._enterRetryTimer); session._enterRetryTimer = null; }
+  if (session._escBusyTimer) { clearTimeout(session._escBusyTimer); session._escBusyTimer = null; }
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
   // stops it, but belt-and-braces.
