@@ -155,13 +155,6 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath) {
-  if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
-  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: filePath, exp })).toString('base64url');
-  const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
-  return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
-}
 
 function generateActionLink(action, roomId, extras) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
@@ -1578,30 +1571,12 @@ function handleClaudeEvent(session, event) {
             indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
           } else if (toolName === 'Write' && input.file_path) {
             isKeyEvent = true;
-            const absPath = path.isAbsolute(input.file_path)
-              ? input.file_path
-              : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
-            if (link) {
-              indicator = `✏️ Writing [${input.file_path}](${link})`;
-              indicatorHtml = `✏️ Writing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
-            } else {
-              indicator = `✏️ Writing ${input.file_path}`;
-              indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
-            }
+            indicator = `✏️ Writing ${input.file_path}`;
+            indicatorHtml = `✏️ Writing <code>${escapeHtml(input.file_path)}</code>`;
           } else if (toolName === 'Edit' && input.file_path) {
             isKeyEvent = true;
-            const absPath = path.isAbsolute(input.file_path)
-              ? input.file_path
-              : path.join(session.workdir, input.file_path);
-            const link = generateFileLink(absPath);
-            if (link) {
-              indicator = `✏️ Editing [${input.file_path}](${link})`;
-              indicatorHtml = `✏️ Editing <a href="${escapeHtml(link)}"><code>${escapeHtml(input.file_path)}</code></a>`;
-            } else {
-              indicator = `✏️ Editing ${input.file_path}`;
-              indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
-            }
+            indicator = `✏️ Editing ${input.file_path}`;
+            indicatorHtml = `✏️ Editing <code>${escapeHtml(input.file_path)}</code>`;
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
             indicatorHtml = `🔍 <code>${escapeHtml(input.pattern)}</code>`;

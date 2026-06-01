@@ -165,6 +165,7 @@ const SENSITIVE_BASENAME_RE = [
   /credentials?\.(json|ya?ml|toml|txt)$/i, /\.(pem|key|p12|pfx|jks|keystore)$/i,
   /id_rsa|id_ed25519|id_ecdsa/i, /\.npmrc$/i, /\.netrc$/i,
   /token(s)?\.(json|txt)$/i, /service[-_]?account.*\.json$/i, /\.htpasswd$/i,
+  /^config\.json$/i,
 ];
 const SENSITIVE_PATH_RE = [/\/\.aws\//i, /\/\.docker\//i, /\/\.kube\//i, /\/\.ssh\//i, /\/\.gnupg\//i];
 function isSensitivePath(p) {
