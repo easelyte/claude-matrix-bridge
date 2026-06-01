@@ -17,15 +17,15 @@
     "ci": "npm run lint && npm run check && npm test && npm run audit:high"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.97.1",
+    "@anthropic-ai/sdk": "^0.100.1",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "matrix-bot-sdk": "^0.8.0",
-    "matrix-js-sdk": "^41.5.0",
+    "matrix-js-sdk": "^41.6.0",
     "node-pty": "^1.0.0",
-    "ws": "^8.20.1",
+    "ws": "^8.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
