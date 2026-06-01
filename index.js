@@ -2370,6 +2370,7 @@ const MATRON_COMMANDS = [
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
   { command: 'tools', description: 'List available tools' },
+  { command: 'label', description: 'Show or set server label for room names' },
   { command: 'help', description: 'Show all commands' },
 ];
 
@@ -3014,6 +3015,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const newLabel = text.replace(/^!\w+\s*/, '').trim();
       if (!newLabel) {
         await sendReply(`Current server label: ${SERVER_LABEL}`);
+      } else if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(sender)) {
+        await sendReply('Only allowed users can change the server label.');
       } else if (!/^[A-Za-z0-9_. -]{1,16}$/.test(newLabel)) {
         await sendReply('Label must be 1-16 characters: letters, numbers, spaces, _ . -');
       } else {
