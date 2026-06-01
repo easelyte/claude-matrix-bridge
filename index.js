@@ -99,7 +99,7 @@ const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedi
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
 
 // Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
-const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
+let SERVER_LABEL = process.env.SERVER_LABEL || (() => {
   const hostname = os.hostname();
   const match = hostname.match(/^(\w+)-(\d+)/);
   if (match) return match[2]; // Just the number
@@ -2540,6 +2540,7 @@ const MATRON_COMMANDS = [
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
   { command: 'tools', description: 'List available tools' },
+  { command: 'label', description: 'Show or set server label for room names' },
   { command: 'help', description: 'Show all commands' },
 ];
 
@@ -3302,6 +3303,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!label': {
+      const newLabel = text.replace(/^!\w+\s*/, '').trim();
+      if (!newLabel) {
+        await sendReply(`Current server label: ${SERVER_LABEL}`);
+      } else if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(sender)) {
+        await sendReply('Only allowed users can change the server label.');
+      } else if (!/^[A-Za-z0-9_. -]{1,16}$/.test(newLabel)) {
+        await sendReply('Label must be 1-16 characters: letters, numbers, spaces, _ . -');
+      } else {
+        SERVER_LABEL = newLabel;
+        await sendReply(`Server label set to: ${SERVER_LABEL}`);
+      }
+      break;
+    }
+
     case '!status': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -3458,7 +3474,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !start --browser [workdir] — Add chrome-devtools MCP (~400M)\n` +
         `  !start --worktree <name> — Isolated git worktree (branch: worktree-<name>)\n` +
         `  !esc — Interrupt current turn (jumps the queue)\n` +
-        `  !flush — Drop all queued messages\n` +
+        `  !clearall — Drop all queued messages\n` +
         `  !stop — Stop the current session\n` +
         `  !restart — Stop and resume (--browser, --worktree accepted)\n` +
         `  !resume <n|id> — Resume session by number or ID (--browser accepted)\n` +
@@ -3467,6 +3483,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Info:\n` +
         `  !status — Session uptime, workdir, restarts\n` +
         `  !working — Toggle tool call visibility\n` +
+        `  !label [name] — Show or set server label for room names\n` +
         `  !mcp — MCP server status\n` +
         `  !model — Current model\n` +
         `  !cost — Session cost\n` +
@@ -3505,6 +3522,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         cmdGroup('Info', [
           ['!status', 'Session uptime, workdir, restarts'],
           ['!working', 'Toggle tool call visibility'],
+          ['!label [name]', 'Show or set server label'],
           ['!mcp', 'MCP server status'],
           ['!model', 'Current model'],
           ['!cost', 'Session cost'],
@@ -3725,6 +3743,7 @@ client.on('room.message', async (roomId, event) => {
       'show', 'show_working', 'working', 'sessions', 'help',
       'mcp', 'model', 'cost', 'usage', 'tools',
       'esc', 'escape', 'clearall', 'flush',
+      'label',
     ]);
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
