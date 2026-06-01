@@ -270,6 +270,14 @@ function getPersistedSession(roomId) {
 
 const sessions = new Map(); // roomId -> session
 
+function isWorktreeInUse(worktreeName, workdir, excludeRoomId) {
+  for (const [rid, s] of sessions) {
+    if (rid === excludeRoomId) continue;
+    if (s.alive && s.worktree === worktreeName && s.workdir === workdir) return true;
+  }
+  return false;
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (INTERACTIVE_MODE) {
     return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
@@ -2834,6 +2842,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
+      // Check for duplicate worktree before creating a room (room creation is irreversible)
+      if (worktree && isWorktreeInUse(worktree, workdir)) {
+        await sendReply(`Worktree "${worktree}" is already in use by another session. Pick a different name.`);
+        return;
+      }
+
       // Create a new room for this session
       let sessionRoomId;
       try {
@@ -2848,15 +2862,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
-
-      if (worktree) {
-        for (const [rid, s] of sessions) {
-          if (s.alive && s.worktree === worktree && s.workdir === workdir) {
-            await sendReply(`Worktree "${worktree}" is already in use by another session. Pick a different name.`);
-            return;
-          }
-        }
-      }
       const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras, worktree });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
@@ -2920,6 +2925,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const effectiveWorktree = restartWorktree || existing.worktree || null;
       if (effectiveWorktree && INTERACTIVE_MODE) {
         await sendReply('--worktree is not yet supported in interactive mode.');
+        return;
+      }
+      if (effectiveWorktree && isWorktreeInUse(effectiveWorktree, existing.workdir, roomId)) {
+        await sendReply(`Worktree "${effectiveWorktree}" is already in use by another session.`);
         return;
       }
       const carriedExtras = Array.isArray(existing.mcpExtras) ? existing.mcpExtras : null;
@@ -3087,6 +3096,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? resumeExtras
         : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
       const effectiveResumeWorktree = resumePersisted?.worktree || null;
+      if (effectiveResumeWorktree && INTERACTIVE_MODE) {
+        await sendReply('Cannot resume a worktree session in interactive mode.');
+        return;
+      }
+      if (effectiveResumeWorktree && isWorktreeInUse(effectiveResumeWorktree, actualWorkdir)) {
+        await sendReply(`Worktree "${effectiveResumeWorktree}" is already in use by another session.`);
+        return;
+      }
       const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras, worktree: effectiveResumeWorktree });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
