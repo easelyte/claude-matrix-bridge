@@ -3127,6 +3127,20 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
       }
 
+      // Validate worktree constraints before creating a room (room creation is irreversible)
+      const resumePersisted = (resumeSessionId
+        ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
+        : null);
+      const effectiveResumeWorktree = resumePersisted?.worktree || null;
+      if (effectiveResumeWorktree && INTERACTIVE_MODE) {
+        await sendReply('Cannot resume a worktree session in interactive mode.');
+        return;
+      }
+      if (effectiveResumeWorktree && isWorktreeInUse(effectiveResumeWorktree, actualWorkdir)) {
+        await sendReply(`Worktree "${effectiveResumeWorktree}" is already in use by another session.`);
+        return;
+      }
+
       // Create a new room for the resumed session
       let sessionRoomId;
       try {
@@ -3149,24 +3163,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
 
-      // Inherit the resumed session's previously persisted extras unless the
-      // user is explicitly overriding via the command line; this lets a
-      // resume "just work" if /start --browser was used originally.
-      const resumePersisted = getPersistedSession(sessionRoomId) || (resumeSessionId
-        ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
-        : null);
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
         : (Array.isArray(resumePersisted?.mcpExtras) ? resumePersisted.mcpExtras : []);
-      const effectiveResumeWorktree = resumePersisted?.worktree || null;
-      if (effectiveResumeWorktree && INTERACTIVE_MODE) {
-        await sendReply('Cannot resume a worktree session in interactive mode.');
-        return;
-      }
-      if (effectiveResumeWorktree && isWorktreeInUse(effectiveResumeWorktree, actualWorkdir)) {
-        await sendReply(`Worktree "${effectiveResumeWorktree}" is already in use by another session.`);
-        return;
-      }
       const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, { mcpExtras: effectiveResumeExtras, worktree: effectiveResumeWorktree });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
