@@ -74,6 +74,13 @@ describe('resolveUploadMeta', () => {
   it('falls back to "file" when nothing is provided', () => {
     expect(resolveUploadMeta({})).toEqual({ filename: 'file', caption: null });
   });
+
+  it('strips directory components from the filename (no path traversal)', () => {
+    expect(resolveUploadMeta({ body: '../../etc/passwd' })).toEqual({
+      filename: 'passwd',
+      caption: null,
+    });
+  });
 });
 
 describe('ivUploadAnnotation', () => {
