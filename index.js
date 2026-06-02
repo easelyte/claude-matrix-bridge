@@ -17,6 +17,7 @@ import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
+import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
@@ -2883,6 +2884,16 @@ async function buildMediaContentBlocks(event, session) {
   if (content.msgtype === 'm.audio') {
     const transcription = await transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
     blocks.push({ type: 'text', text: `[Voice note transcription]: ${transcription}` });
+  } else if (session.iv) {
+    // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
+    // only an absolute-path annotation; Claude reads it with its Read tool.
+    // No base64 blocks and no inline content dump (SDK mode keeps those).
+    const { filename, caption } = resolveUploadMeta(content);
+    const dir = ivUploadDir(session.roomId);
+    const savePath = deduplicateFilename(dir, filename);
+    fs.writeFileSync(savePath, buffer);
+    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: content.msgtype, savePath, caption }) });
+    return blocks; // caption already folded in; skip the SDK caption append below
   } else if (content.msgtype === 'm.image') {
     let imgPath;
     try { imgPath = deduplicateFilename(uploadsDir(session), fileName); }

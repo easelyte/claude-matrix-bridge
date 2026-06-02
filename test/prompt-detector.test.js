@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyScreen, stripAnsi, PromptDetector } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, PromptDetector } from '../lib/prompt-detector.js';
 
 describe('stripAnsi', () => {
   it('removes color codes', () => {
@@ -569,6 +569,19 @@ describe('classifyScreen — null cases', () => {
     expect(classifyScreen(screen)).toBeNull();
   });
 
+  it('returns null on a wrapped prose line read as a 2-item arrow menu (input-box false positive)', () => {
+    // Live false positive: the user's long message wraps in claude's input
+    // box to `❯ <110+ chars>` + a short continuation, which the arrow-menu
+    // detector read as a menu. Wrapped prose exceeds the menu-option length
+    // bound, so it must be rejected.
+    const screen = [
+      'whichever PR(s) you are actually merging?',
+      '❯ also can we add a button in the hoodie editor to bake the design using both different bakers so we can quicikly',
+      '  compare them?',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
   it('handles cursor-positioning-stripped output where marker + number + label have no spaces', () => {
     // After ANSI/CSI strip of a TUI that positions characters via cursor
     // moves, the lines look like "❯1.Yes,andbypasspermissions" — no space
@@ -598,6 +611,35 @@ describe('classifyScreen — null cases', () => {
     const r = classifyScreen(screen);
     expect(r).not.toBeNull();
     expect(r.kind).toBe('arrow-menu');
+  });
+});
+
+describe('stripInputBox', () => {
+  it('removes the background-filled input field so it is not read as a menu', () => {
+    // Claude renders its input box as full-line background-filled rows:
+    // `\x1b[48;5;237m\x1b[38;5;239m❯ <text>`. A wrapped/multi-line user
+    // message there would otherwise classify as an arrow menu.
+    const raw =
+      'Some response ending in a question?\r\r\n' +
+      '\x1b[48;5;237m\x1b[38;5;239m❯ \x1b[38;5;231mHi there\x1b[39m   \x1b[49m\r\r\n' +
+      '\x1b[48;5;237m  \x1b[38;5;231mcan you help me?\x1b[39m   \x1b[49m\r\r\n';
+    // Without stripping, this is a false-positive arrow menu.
+    expect(classifyScreen(stripAnsi(raw))).not.toBeNull();
+    // With stripping, the input field is gone and nothing classifies.
+    expect(classifyScreen(stripAnsi(stripInputBox(raw)))).toBeNull();
+  });
+
+  it('keeps a genuinely highlighted numbered menu option', () => {
+    // The selected option in a real numbered menu can be background-filled
+    // too — but it has a number after the marker, so it must survive.
+    const raw =
+      'Would you like to proceed?\r\r\n' +
+      '\x1b[48;5;237m\x1b[38;5;231m❯ 1. Yes, and bypass permissions\x1b[49m\r\r\n' +
+      '  2. No, refine\r\r\n';
+    const r = classifyScreen(stripAnsi(stripInputBox(raw)));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.label)).toEqual(['Yes, and bypass permissions', 'No, refine']);
   });
 });
 
