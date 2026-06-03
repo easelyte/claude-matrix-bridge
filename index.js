@@ -751,7 +751,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
             throw new Error('sendToSession returned false (session unavailable)');
           }
           delivered = true;
-          session.pendingAutoPrompt = null;                // consume ONLY after confirmed delivery
+          // iv.sendText pastes now but submits Enter ~500ms later. Don't clear
+          // pendingAutoPrompt synchronously: if the PTY dies in that paste→Enter
+          // window the restart path must still carry the prompt. Defer the clear,
+          // gated on the session still being alive (= Enter submitted). A dead
+          // session keeps pendingAutoPrompt for restart re-injection (T-3.6).
+          setTimeout(() => { if (session.alive) session.pendingAutoPrompt = null; }, 1500);
           // R500: never persist prompt content or send it to Gemini. Push a neutral marker so
           // summarization sees a first turn; name the room from the non-secret worktree slug.
           (session.chatHistory ||= []).push({ role: 'user', text: '[queued prompt]' });
@@ -4043,8 +4048,11 @@ client.on('room.message', async (roomId, event) => {
 
   if (!text && !hasMedia) return;
 
+  // R500: redact any --prompt value before logging — this runs before command
+  // parsing, so a `!start --prompt "secret"` would otherwise leak into service logs.
+  const logText = text.replace(/--prompt\s+.*/s, '--prompt <redacted>');
   console.log(
-    `Message from ${sender} in ${roomId}: ${text.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
+    `Message from ${sender} in ${roomId}: ${logText.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
   );
 
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
