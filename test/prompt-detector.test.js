@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyScreen, stripAnsi, stripInputBox, PromptDetector } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector } from '../lib/prompt-detector.js';
 
 describe('stripAnsi', () => {
   it('removes color codes', () => {
@@ -686,5 +686,98 @@ describe('PromptDetector', () => {
     await new Promise(r => setTimeout(r, 100));
     expect(events).toHaveLength(1);
     expect(events[0].kind).toBe('yes-no');
+  });
+});
+
+describe('isIdleReadyScreen', () => {
+  it('returns false for an empty / pre-render screen', () => {
+    expect(isIdleReadyScreen('')).toBe(false);
+    expect(isIdleReadyScreen('\x1b[2J\x1b[H')).toBe(false);
+  });
+
+  it('returns true for an idle input screen (bypass-permissions status line)', () => {
+    const screen = [
+      '❯ ',
+      '────────────────────────────────────────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(true);
+  });
+
+  it('returns true for the "? for shortcuts" idle hint', () => {
+    expect(isIdleReadyScreen('❯ \n──────\n  ? for shortcuts')).toBe(true);
+  });
+
+  it('returns false while a turn is running (esc to interrupt present)', () => {
+    // The working state shows BOTH the bypass status line AND "esc to
+    // interrupt" — the interrupt hint must win so we keep waiting.
+    const screen = [
+      '✻ Baking… (12s)',
+      '────────────────────────────────────────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+
+  it('returns false while compacting (spinner + esc to interrupt)', () => {
+    const screen = [
+      '✻ Compacting conversation…',
+      '────────────────────────────────────────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+
+  it('is robust to cursor-forward gaps that collapse spaces', () => {
+    // claude renders inter-word gaps with CSI cursor-forward (\x1b[1C), which
+    // stripAnsi turns into spaces — but real captures sometimes arrive with
+    // the words run together. Both the idle and working tokens must match
+    // their whitespace-stripped forms.
+    expect(isIdleReadyScreen('⏵⏵bypasspermissionson (shift+tabtocycle)')).toBe(true);
+    expect(isIdleReadyScreen('⏵⏵bypasspermissionson·esctointerrupt')).toBe(false);
+  });
+
+  it('is NOT ready while the resume-summary picker is showing', () => {
+    // The picker shows "Enter to confirm · Esc to cancel" — NOT the idle
+    // "bypass permissions" status line — so the resume hold must keep waiting
+    // and never type the held message into the menu.
+    const screen = [
+      'This session is 2h 35m old and 200.2k tokens.',
+      'We recommend resuming from a summary.',
+      '❯ 1. Resume from summary (recommended)',
+      '  2. Resume full session as-is',
+      "  3. Don't ask me again",
+      'Enter to confirm · Esc to cancel',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+});
+
+describe('classifyScreen — resume-from-summary picker', () => {
+  // Real modal claude shows when resuming a previously-compacted session. The
+  // bridge must surface this as a numbered question; if classifyScreen ever
+  // stops catching it, auto-resume of a compacted iv session silently stalls
+  // (the picker blocks input and is never answered).
+  it('classifies the resume-summary picker as a numbered prompt', () => {
+    const screen = [
+      'This session is 2h 35m old and 200.2k tokens.',
+      'Resuming the full session will consume a substantial portion of your usage',
+      'limits. We recommend resuming from a summary.',
+      '',
+      '❯ 1. Resume from summary (recommended)',
+      '  2. Resume full session as-is',
+      "  3. Don't ask me again",
+      '',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.label)).toEqual([
+      'Resume from summary (recommended)',
+      'Resume full session as-is',
+      "Don't ask me again",
+    ]);
+    expect(r.question).toMatch(/recommend resuming from a summary/);
   });
 });
