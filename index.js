@@ -721,6 +721,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       session.ivPendingInput = null;
       sendToSession(session, pending);
     }
+    // Fire a join-armed auto-prompt AFTER draining any operator input, now that the
+    // TUI is ready (so it writes straight to the PTY, never into the single-slot
+    // ivPendingInput stash where it could be overwritten). Set by sendPendingWelcomeIfNeeded.
+    if (session._fireAutoPromptWhenReady) {
+      const fire = session._fireAutoPromptWhenReady;
+      session._fireAutoPromptWhenReady = null;
+      fire();
+    }
   }
 
   let _ivPtyBuf = '';
@@ -4513,36 +4521,48 @@ async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
 
   const { plain: welcomePlain, html: welcomeHtml } = buildWelcome(session.workdir);
 
+  // Wrap the welcome send so a transient failure can't strand the queued prompt
+  // below (pendingWelcome is already false, so this handler won't run again).
   if (session.sendHtml) {
-    await session.sendHtml(welcomePlain, welcomeHtml);
+    try { await session.sendHtml(welcomePlain, welcomeHtml); }
+    catch (e) { debug(`[IV] welcome send failed: ${e.message}`); }
   }
 
-  // --prompt dispatch: now that the operator has joined and keys are shared,
-  // fire the queued prompt as their first message. sendToSession handles the
-  // TUI-not-ready case (stash + deliver on markIvReady), so this works whether
-  // the session is already up or still loading. The room is encrypted and the
-  // operator is present, so echoing the prompt for transcript context is fine.
+  // --prompt dispatch: now that the operator has joined and keys are shared, fire
+  // the queued prompt as their first message. Deliver ONLY when the TUI is ready,
+  // so it writes straight to the PTY rather than into the single-slot ivPendingInput
+  // stash (which a fast operator message could overwrite). Echo/persist happen only
+  // after a real delivery. If the TUI isn't ready yet, arm markIvReady to fire it
+  // after it drains any operator input.
   if (session.pendingAutoPrompt) {
-    const promptText = session.pendingAutoPrompt;
-    session.pendingAutoPrompt = null;
-    if (session.sendHtml) {
-      await session.sendHtml(`> ${promptText}`, `<blockquote>${escapeHtml(promptText)}</blockquote>`);
-    }
-    if (sendToSession(session, [{ type: 'text', text: promptText }]) === false) {
-      if (session.sendCallback) session.sendCallback('⚠️ Queued prompt could not be delivered — the session is unavailable. Send it manually.');
-      return;
-    }
-    if (!session.chatHistory) session.chatHistory = [];
-    session.chatHistory.push({ role: 'user', text: promptText });
-    if (session.claudeSessionId) {
-      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
-    }
-    if (!session.firstMessageCaptured) {
-      session.firstMessageCaptured = true;
-      // Name from the non-secret worktree slug (no Gemini call on prompt content).
-      const short = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-      if (session.worktree) updateRoomName(session.roomId, `${SERVER_LABEL}:${short} ${session.worktree}`);
-    }
+    const fireAutoPrompt = async () => {
+      const promptText = session.pendingAutoPrompt;
+      if (!promptText) return;
+      session.pendingAutoPrompt = null;
+      if (sendToSession(session, [{ type: 'text', text: promptText }]) === false) {
+        if (session.sendCallback) session.sendCallback('⚠️ Queued prompt could not be delivered — the session is unavailable. Send it manually.');
+        return;
+      }
+      // The room is encrypted and the operator is present, so echoing the prompt
+      // for transcript context is fine. Only after a confirmed (non-stashed) write.
+      if (session.sendHtml) {
+        try { await session.sendHtml(`> ${promptText}`, `<blockquote>${escapeHtml(promptText)}</blockquote>`); }
+        catch (e) { debug(`[IV] prompt echo failed: ${e.message}`); }
+      }
+      if (!session.chatHistory) session.chatHistory = [];
+      session.chatHistory.push({ role: 'user', text: promptText });
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+      }
+      if (!session.firstMessageCaptured) {
+        session.firstMessageCaptured = true;
+        // Name from the non-secret worktree slug (no Gemini call on prompt content).
+        const short = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+        if (session.worktree) updateRoomName(session.roomId, `${SERVER_LABEL}:${short} ${session.worktree}`);
+      }
+    };
+    if (session.ivReady) await fireAutoPrompt();
+    else session._fireAutoPromptWhenReady = fireAutoPrompt;
   }
 }
 
