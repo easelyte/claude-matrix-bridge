@@ -2159,7 +2159,11 @@ function sendToSession(session, contentBlocks) {
         if (session.resetTimeout) session.resetTimeout();
         return true;
       }
-      session.iv.sendText(text);
+      // Propagate a dead-PTY write failure: iv.sendText returns false when the
+      // PTY has exited (lib/interactive-session.js). Surfacing false lets callers
+      // (incl. the auto-prompt path's delivery check) detect a lost write instead
+      // of falsely reporting success.
+      if (session.iv.sendText(text) === false) return false;
       // Enter retry: after sending text, the 500ms delayed Enter may be
       // swallowed if the TUI has a transient hiccup. Watch for transcript
       // activity — if none arrives within 3s, retry Enter. Up to 2 retries.

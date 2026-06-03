@@ -24,6 +24,10 @@ describe('extractPromptFlag', () => {
     expect(r.prompt).toBeNull();
     expect(r.error).toMatch(/missing closing quote/);
   });
+  it('honors backslash-escaped quotes inside the prompt', () => {
+    expect(extractPromptFlag('/repo --prompt "say \\"hello\\" then stop"'))
+      .toEqual({ prompt: 'say "hello" then stop', rest: '/repo', error: null });
+  });
   it('rejects an empty quoted prompt (P8)', () => {
     const r = extractPromptFlag('--worktree x --prompt ""');
     expect(r.prompt).toBeNull();
