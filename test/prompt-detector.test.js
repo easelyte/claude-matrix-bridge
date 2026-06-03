@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, test, expect } from 'vitest';
 import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector } from '../lib/prompt-detector.js';
 
 describe('stripAnsi', () => {
@@ -7,6 +7,10 @@ describe('stripAnsi', () => {
   });
   it('removes cursor movements and modes', () => {
     expect(stripAnsi('\x1b[2J\x1b[H\x1b[?25lhello\x1b[?25h')).toBe('hello');
+  });
+  it('removes CSI sequences with intermediates or non-letter finals', () => {
+    expect(stripAnsi('\x1b[4 q1. Yes')).toBe('1. Yes');
+    expect(stripAnsi('\x1b[1~1. Yes')).toBe('1. Yes');
   });
   it('removes bare CR that has no LF after it (TUI overwrites)', () => {
     expect(stripAnsi('foo\rbar\r\nbaz')).toBe('foobar\nbaz');
@@ -32,6 +36,164 @@ describe('stripAnsi', () => {
     expect(stripAnsi('a\x1b[1Eb\x1b[1Ec')).toBe('a\nb\nc');
     // No digits = 1 line.
     expect(stripAnsi('a\x1b[Bb')).toBe('a\nb');
+  });
+});
+
+describe('stripAnsi — CHA (Cursor Horizontal Absolute) word-boundary fixtures', () => {
+  // These fixtures reproduce the bytes Claude's TUI emits when positioning text
+  // within a visual row using CSI CHA (\x1b[<n>G) instead of literal spaces.
+  // The old regex-chain stripAnsi deleted \x1b[nG with no replacement, collapsing
+  // all inter-word gaps to nothing. The new column-aware pass converts CHA to
+  // the correct number of padding spaces so classifyScreen sees readable text.
+
+  test('spec exact bytes: CHA-positioned option label reconstructs word-separated text', () => {
+    // From the spec/plan — the literal byte sequence for resume option 2.
+    // ^[[5G^[[38;5;246m2.^[[8G^[[39mResume^[[15Gfull^[[20Gsession^[[28Gas-is
+    // Without CHA→spaces this collapses to "2.Resumefullsessionas-is".
+    const specBytes =
+      '\x1b[5G\x1b[38;5;246m2.\x1b[8G\x1b[39mResume\x1b[15Gfull\x1b[20Gsession\x1b[28Gas-is';
+    const result = stripAnsi(specBytes);
+    expect(result).toContain('Resume full session as-is');
+  });
+
+  test('CHA forward-only: pads to target column when target > current col', () => {
+    // col starts at 1; CHA 5 → 4 spaces; 'Hello' → col 10; CHA 11 → 1 space; 'world'
+    expect(stripAnsi('\x1b[5GHello\x1b[11Gworld')).toBe('    Hello world');
+  });
+
+  test('CHA no-rewrite (A1): back-positioning does not erase previously emitted text', () => {
+    // col=1; 'Hello' → col 6; CHA 3 ≤ col 6 → only repositions, emits nothing.
+    // Output keeps 'Hello' intact, 'World' follows without gap.
+    const result = stripAnsi('Hello\x1b[3GWorld');
+    expect(result).toBe('HelloWorld');
+  });
+
+  test('CHA col cap: target clamped to COL_CAP (120), not beyond terminal width', () => {
+    // CHA 200 must clamp to 120; starting at col 1 → 119 spaces before 'End'.
+    const result = stripAnsi('\x1b[200GEnd');
+    expect(result).toBe(' '.repeat(119) + 'End');
+  });
+
+  test('CHA 0 clamps to 1: degenerate param treated as column 1', () => {
+    // n=0 should clamp to 1; starting at col=1 → target=col → no pad.
+    expect(stripAnsi('\x1b[0GHello')).toBe('Hello');
+  });
+
+  test('cursor-forward cap is MAX_FWD_SPACES (80), distinct from CHA cap (120)', () => {
+    // Cursor-forward 81 → capped at 80; CHA 121 → capped at 120 (not 80).
+    // The two caps are intentionally different constants.
+    expect(stripAnsi('\x1b[81Cy')).toBe(' '.repeat(80) + 'y');
+    // CHA 121 from col=1 → clamp to 120 → 119 spaces
+    expect(stripAnsi('\x1b[121GEnd')).toBe(' '.repeat(119) + 'End');
+  });
+
+  test('resume menu fixture: CHA-positioned option labels reconstruct with spaces', () => {
+    // Mirrors real PTY bytes for Claude's session-resume menu.
+    // The ❯ marker causes the numbered detector to accept the run.
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'What\x1b[6Gwould\x1b[12Gyou\x1b[16Glike\x1b[21Gto\x1b[24Gdo?',
+      '❯ 1.\x1b[5GResume\x1b[12Gfrom\x1b[17Gsummary',
+      '  2.\x1b[5GResume\x1b[12Gfull\x1b[17Gsession\x1b[25Gas-is',
+      '  3.\x1b[5GStart\x1b[11Gnew\x1b[15Gsession',
+    ].join('\n');
+    const stripped = stripAnsi(raw);
+    // Every word gap must be present (not collapsed).
+    expect(stripped).toContain('This session');
+    expect(stripped).toContain('14h 16m old');
+    expect(stripped).toContain('Resume full session as-is');
+    expect(stripped).toContain('Start new session');
+  });
+
+  test('resume menu fixture: classifyScreen returns correct kind/question/options', () => {
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'What\x1b[6Gwould\x1b[12Gyou\x1b[16Glike\x1b[21Gto\x1b[24Gdo?',
+      '❯ 1.\x1b[5GResume\x1b[12Gfrom\x1b[17Gsummary',
+      '  2.\x1b[5GResume\x1b[12Gfull\x1b[17Gsession\x1b[25Gas-is',
+      '  3.\x1b[5GStart\x1b[11Gnew\x1b[15Gsession',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('session is 14h 16m old');
+    expect(r.options).toHaveLength(3);
+    expect(r.options[1].label).toContain('Resume full session as-is');
+    expect(r.options[2].label).toContain('Start new session');
+  });
+
+  test('plan-mode confirmation fixture: CHA-positioned text reconstructs with spaces', () => {
+    // Mirrors the plan-mode confirm menu where the session-age question
+    // and option labels are positioned via CHA.
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'Claude\x1b[8Ghas\x1b[12Gwritten\x1b[20Gup\x1b[23Ga\x1b[25Gplan.',
+      'Would\x1b[7Gyou\x1b[11Glike\x1b[16Gto\x1b[19Gproceed?',
+      '❯ 1.\x1b[6GYes,\x1b[11Gand\x1b[15Gbypass\x1b[22Gpermissions',
+      '  2.\x1b[6GYes,\x1b[11Gmanually\x1b[20Gapprove\x1b[28Gedits',
+      '  3.\x1b[6GNo,\x1b[10Grefine\x1b[17Gwith\x1b[22GUltraplan',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const stripped = stripAnsi(raw);
+    expect(stripped).toContain('This session is 14h 16m old');
+    expect(stripped).toContain('Claude has written up a plan');
+    expect(stripped).toContain('Would you like to proceed');
+    expect(stripped).toContain('Yes, and bypass permissions');
+    expect(stripped).toContain('Tell Claude what to change');
+  });
+
+  test('plan-mode confirmation fixture: classifyScreen returns kind/question/options/freeTextIdx', () => {
+    const raw = [
+      'This\x1b[6Gsession\x1b[14Gis\x1b[17G14h\x1b[21G16m\x1b[25Gold.',
+      'Claude\x1b[8Ghas\x1b[12Gwritten\x1b[20Gup\x1b[23Ga\x1b[25Gplan.',
+      'Would\x1b[7Gyou\x1b[11Glike\x1b[16Gto\x1b[19Gproceed?',
+      '❯ 1.\x1b[6GYes,\x1b[11Gand\x1b[15Gbypass\x1b[22Gpermissions',
+      '  2.\x1b[6GYes,\x1b[11Gmanually\x1b[20Gapprove\x1b[28Gedits',
+      '  3.\x1b[6GNo,\x1b[10Grefine\x1b[17Gwith\x1b[22GUltraplan',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('This session is 14h 16m old');
+    expect(r.options).toHaveLength(4);
+    expect(r.options[0].label).toContain('Yes, and bypass permissions');
+    expect(r.options[1].label).toContain('Yes, manually approve edits');
+    expect(r.freeTextIdx).toBe(3);
+  });
+
+  test('AskUserQuestion menu fixture: CHA-positioned labels reconstruct with spaces', () => {
+    // Mirrors an AskUserQuestion-style numbered menu where each option label
+    // is built with CHA moves between individual words.
+    const raw = [
+      'Which\x1b[7Gapproach\x1b[16Gdo\x1b[19Gyou\x1b[23Gprefer?',
+      '❯ 1.\x1b[6GBake\x1b[11Gshould\x1b[18Gmatch\x1b[24Geditor',
+      '  2.\x1b[6GEditor\x1b[13Gshould\x1b[20Gmatch\x1b[26Gbake',
+      '  3.\x1b[6GNot\x1b[10Gsure',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const stripped = stripAnsi(raw);
+    expect(stripped).toContain('Which approach do you prefer');
+    expect(stripped).toContain('Bake should match editor');
+    expect(stripped).toContain('Editor should match bake');
+  });
+
+  test('AskUserQuestion menu fixture: classifyScreen returns correct kind/question/options', () => {
+    const raw = [
+      'Which\x1b[7Gapproach\x1b[16Gdo\x1b[19Gyou\x1b[23Gprefer?',
+      '❯ 1.\x1b[6GBake\x1b[11Gshould\x1b[18Gmatch\x1b[24Geditor',
+      '  2.\x1b[6GEditor\x1b[13Gshould\x1b[20Gmatch\x1b[26Gbake',
+      '  3.\x1b[6GNot\x1b[10Gsure',
+      '  4.\x1b[6GTell\x1b[11GClaude\x1b[18Gwhat\x1b[23Gto\x1b[26Gchange',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('Which approach do you prefer');
+    expect(r.options).toHaveLength(4);
+    expect(r.options[0].label).toContain('Bake should match editor');
+    expect(r.options[1].label).toContain('Editor should match bake');
+    expect(r.options[3].label).toContain('Tell Claude what to change');
   });
 });
 
@@ -82,6 +244,20 @@ describe('classifyScreen — numbered', () => {
     const r = classifyScreen(screen);
     expect(r.kind).toBe('numbered');
     expect(r.options.map(o => o.label)).toEqual(['Foo', 'Bar']);
+  });
+
+  it('detects menu options after cursor-shape or key-style CSI sequences', () => {
+    for (const csi of ['\x1b[4 q', '\x1b[1~']) {
+      const screen = stripAnsi([
+        'Pick one:',
+        `${csi}1. Yes`,
+        '2. No',
+      ].join('\n'));
+      const r = classifyScreen(screen);
+      expect(r).not.toBeNull();
+      expect(r.kind).toBe('numbered');
+      expect(r.options.map(o => o.label)).toEqual(['Yes', 'No']);
+    }
   });
 
   it('returns null for a single numbered line (not enough to be a menu)', () => {
