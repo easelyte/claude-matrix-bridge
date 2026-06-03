@@ -331,12 +331,6 @@ function isWorktreeInUse(worktreeName, workdir, excludeRoomId) {
 }
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
-  // suppressWelcome/autoPrompt are interactive-mode only (the --prompt dispatch
-  // path). Guard BEFORE the INTERACTIVE_MODE branch so it can't be silently
-  // dropped by the print-mode path (which hardcodes pendingWelcome: true).
-  if (!INTERACTIVE_MODE && (options.suppressWelcome || options.autoPrompt != null)) {
-    throw new Error('suppressWelcome/autoPrompt are interactive-mode only');
-  }
   if (INTERACTIVE_MODE) {
     return createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
   }
@@ -708,12 +702,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     chatHistory: [],
     pinnedSummaryEventId: null,
     pinnedSummaryText: '',
-    pendingWelcome: options.suppressWelcome ? false : true,
+    pendingWelcome: true,
     pendingInteractivePrompt: null,
     // Auto-injected prompt for --prompt dispatch (distinct from pendingInteractivePrompt,
-    // which is a TUI dialog). Set at construction so markIvReady (which can fire on a fast
-    // pty-data /effort detection before the caller could post-assign) always observes it.
-    pendingAutoPrompt: options.autoPrompt ?? null,
+    // the TUI dialog). Set post-create by the !start handler; fired by the join handler
+    // (sendPendingWelcomeIfNeeded) once the operator joins and keys are shared.
+    pendingAutoPrompt: null,
     ivReady: false,
     ivPendingInput: null,
   };
@@ -722,58 +716,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.ivReady) return;
     session.ivReady = true;
     debug(`[IV] Session marked ready, pending input: ${!!session.ivPendingInput}`);
-    const hadPending = !!session.ivPendingInput;          // operator typed before ready?
     if (session.ivPendingInput) {
       const pending = session.ivPendingInput;
       session.ivPendingInput = null;
       sendToSession(session, pending);
-    }
-    if (session.pendingAutoPrompt) {
-      if (hadPending) { handleOperatorOverrideSkip(session); return; }  // operator's msg wins
-      const promptText = session.pendingAutoPrompt;
-      // Two-stage busy: this pre-claim only covers the banner-await window (so a concurrent
-      // room.message hits the busy-queue path instead of racing the PTY). sendToSession sets
-      // busy=true again internally on the actual send; onTurnEnd clears it at turn end. The
-      // catch's `if (!delivered) busy=false` releases the pre-claim on banner failure.
-      session.busy = true;
-      (async () => {
-        let delivered = false;
-        try {
-          if (session.sendHtml) {                          // content-free banner (NO prompt text — R500)
-            const { plain, html } = buildWelcome(session.workdir);
-            // Plain await (no timeout race): sendHtml→sendToRoom catches send errors and
-            // returns null, so it resolves rather than hanging. Awaiting preserves the
-            // welcome → banner → response order.
-            const r = await session.sendHtml(`${plain}\n▶ Running the queued prompt now.`, `${html}<br/><br/><i>▶ Running the queued prompt now.</i>`);
-            if (!r) debug(`[IV] banner send failed (len=${promptText.length})`); // length only; deliver anyway
-          }
-          if (sendToSession(session, [{ type: 'text', text: promptText }]) === false) {
-            throw new Error('sendToSession returned false (session unavailable)');
-          }
-          delivered = true;
-          // iv.sendText pastes now but submits Enter ~500ms later. Don't clear
-          // pendingAutoPrompt synchronously: if the PTY dies in that paste→Enter
-          // window the restart path must still carry the prompt. Defer the clear,
-          // gated on the session still being alive (= Enter submitted). A dead
-          // session keeps pendingAutoPrompt for restart re-injection (T-3.6).
-          setTimeout(() => { if (session.alive) session.pendingAutoPrompt = null; }, 1500);
-          // R500: never persist prompt content or send it to Gemini. Push a neutral marker so
-          // summarization sees a first turn; name the room from the non-secret worktree slug.
-          (session.chatHistory ||= []).push({ role: 'user', text: '[queued prompt]' });
-          if (session.claudeSessionId) {
-            persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
-          }
-          session.firstMessageCaptured = true;             // stop room.message re-naming on the next message
-          if (session.worktree) {                          // name from worktree slug, NOT prompt (R500, no Gemini)
-            const short = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-            updateRoomName(session.roomId, `${SERVER_LABEL}:${short} ${session.worktree}`);
-          }
-        } catch (e) {
-          if (!delivered) session.busy = false;            // release pre-claim; keep pendingAutoPrompt for restart recovery
-          if (session.sendCallback) session.sendCallback('⚠️ Queued prompt failed to start — send it manually.');
-          debug(`[IV] auto-prompt injection error (len=${promptText.length}): ${e.message}`); // length only
-        }
-      })();
     }
   }
 
@@ -853,11 +799,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Pass mcpExtras explicitly (see the matching block in print-mode
         // createSession): the persistence-fallback in createSession can miss
         // a fresh session that crashed before its first persist.
-        // Carry a queued auto-prompt through CONSTRUCTION (race-free, like the
-        // initial !start path) so the restarted session re-injects on markIvReady.
-        // It's null after a successful first injection, so a post-injection crash
-        // carries nothing.
-        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras, worktree: session.worktree, autoPrompt: session.pendingAutoPrompt, suppressWelcome: session.pendingAutoPrompt != null });
+        const restarted = createSession(roomId, cwd, session.claudeSessionId, { mcpExtras: session.mcpExtras, worktree: session.worktree });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
         restarted.sendHtml = session.sendHtml;
@@ -2768,9 +2710,9 @@ const MATRON_COMMANDS = [
   { command: 'help', description: 'Show all commands' },
 ];
 
-async function createSessionRoom(inviteUserId, { encrypted = ENCRYPT_SESSION_ROOMS } = {}) {
+async function createSessionRoom(inviteUserId) {
   const initialState = [
-    ...(encrypted ? [{
+    ...(ENCRYPT_SESSION_ROOMS ? [{
       type: 'm.room.encryption',
       state_key: '',
       content: { algorithm: 'm.megolm.v1.aes-sha2' },
@@ -3167,13 +3109,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      // Create a new room for this session. --prompt-dispatched rooms are created
-      // UNENCRYPTED so the fire-and-forget transcript is readable before the
-      // operator joins (Claude produces output pre-join). Non-prompt rooms keep
-      // the ENCRYPT_SESSION_ROOMS default.
+      // Create a new room for this session (encrypted per ENCRYPT_SESSION_ROOMS).
       let sessionRoomId;
       try {
-        sessionRoomId = await createSessionRoom(sender, { encrypted: autoPrompt !== null ? false : undefined });
+        sessionRoomId = await createSessionRoom(sender);
       } catch (e) {
         console.error('Failed to create session room:', e);
         await sendReply(`Failed to create session room: ${e.message}`);
@@ -3184,13 +3123,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
       const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
-      // suppressWelcome + autoPrompt threaded at construction so the injection path
-      // (markIvReady) owns the welcome+banner and observes the prompt race-free.
-      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras, worktree, suppressWelcome: autoPrompt !== null, autoPrompt });
+      const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras, worktree });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      // --prompt dispatch: the queued prompt fires when the operator joins the new
+      // room (sendPendingWelcomeIfNeeded), after key-sharing — so the encrypted
+      // transcript is fully readable. Set after the callbacks are wired; join always
+      // happens later, so no construction race.
+      if (autoPrompt !== null) session.pendingAutoPrompt = autoPrompt;
       // In iv-mode claudeSessionId is known immediately, so persist mcpExtras
       // now — otherwise a bridge restart before the first transcript-driven
       // persist would lose the user's opt-in. Print-mode sessions get their
@@ -3827,7 +3769,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!start', 'Start a new session (creates a new room)'],
           ['!start &lt;workdir&gt;', 'Start in a specific directory'],
           ['!start --browser [workdir]', 'Also enable chrome-devtools MCP (~400M)'],
-          ['!start --worktree &lt;slug&gt; --prompt "…"', 'Dispatch a worktree session; the prompt runs automatically when ready. Interactive-mode only. Note: your command stays in this room and dispatch rooms are unencrypted — no secrets in --prompt.'],
+          ['!start --worktree &lt;slug&gt; --prompt "…"', 'Dispatch a worktree session; the prompt fires automatically as your first message when you open the new room. Interactive-mode only.'],
           ['!esc', 'Interrupt current turn (jumps the queue)'],
           ['!clearall', 'Drop all queued messages'],
           ['!stop', 'Stop the current session'],
@@ -4557,20 +4499,6 @@ function buildWelcome(workdir) {
   return { plain, html };
 }
 
-// Operator typed a first message before the TUI was ready → their message wins.
-// Abandon the queued auto-prompt WITHOUT persisting/naming from it, and send the
-// welcome directly (the join already consumed the construction-suppressed welcome,
-// so a pendingWelcome flag-restore would fire nothing).
-function handleOperatorOverrideSkip(session) {
-  session.pendingAutoPrompt = null;
-  if (session.sendHtml) {
-    const { plain, html } = buildWelcome(session.workdir);
-    session.sendHtml(plain, html).catch(() => {});        // fire-and-forget; never wedge the turn
-  } else {
-    debug('[IV] override-skip: sendHtml not yet wired, welcome dropped'); // rare early-fire
-  }
-}
-
 async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
   const session = sessions.get(roomId);
   if (!session || !session.pendingWelcome) return;
@@ -4587,6 +4515,34 @@ async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
 
   if (session.sendHtml) {
     await session.sendHtml(welcomePlain, welcomeHtml);
+  }
+
+  // --prompt dispatch: now that the operator has joined and keys are shared,
+  // fire the queued prompt as their first message. sendToSession handles the
+  // TUI-not-ready case (stash + deliver on markIvReady), so this works whether
+  // the session is already up or still loading. The room is encrypted and the
+  // operator is present, so echoing the prompt for transcript context is fine.
+  if (session.pendingAutoPrompt) {
+    const promptText = session.pendingAutoPrompt;
+    session.pendingAutoPrompt = null;
+    if (session.sendHtml) {
+      await session.sendHtml(`> ${promptText}`, `<blockquote>${escapeHtml(promptText)}</blockquote>`);
+    }
+    if (sendToSession(session, [{ type: 'text', text: promptText }]) === false) {
+      if (session.sendCallback) session.sendCallback('⚠️ Queued prompt could not be delivered — the session is unavailable. Send it manually.');
+      return;
+    }
+    if (!session.chatHistory) session.chatHistory = [];
+    session.chatHistory.push({ role: 'user', text: promptText });
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+    }
+    if (!session.firstMessageCaptured) {
+      session.firstMessageCaptured = true;
+      // Name from the non-secret worktree slug (no Gemini call on prompt content).
+      const short = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+      if (session.worktree) updateRoomName(session.roomId, `${SERVER_LABEL}:${short} ${session.worktree}`);
+    }
   }
 }
 
