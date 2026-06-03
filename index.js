@@ -4539,6 +4539,11 @@ async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
       const promptText = session.pendingAutoPrompt;
       if (!promptText) return;
       session.pendingAutoPrompt = null;
+      // Operator-override: if the operator already sent a first message (set whether
+      // it was delivered or stashed), it wins — skip the auto-prompt entirely rather
+      // than deliver a second message back-to-back (which the paste→delayed-Enter
+      // model could merge/reorder). Their message is already in the room + the PTY.
+      if (session.firstMessageCaptured) return;
       if (sendToSession(session, [{ type: 'text', text: promptText }]) === false) {
         if (session.sendCallback) session.sendCallback('⚠️ Queued prompt could not be delivered — the session is unavailable. Send it manually.');
         return;
