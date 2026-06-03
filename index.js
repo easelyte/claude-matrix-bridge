@@ -14,7 +14,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { extractUrls } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -45,6 +45,17 @@ const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || p
 // behaviour, or 0 to disable the reaper entirely).
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
+
+// Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
+// several seconds to load the transcript — and longer if it auto-compacts —
+// far longer than the 500ms paste→Enter window in sendText. Typing the first
+// message in immediately drops it (the paste lands in a not-ready input box and
+// the Enter is swallowed). So we HOLD post-resume messages and only flush them
+// once the TUI goes idle-and-ready: PTY output quiesces for QUIET_MS AND the
+// screen shows the idle input box (no "esc to interrupt"). HARDCAP_MS is the
+// backstop so a message is never lost if readiness is never detected.
+const RESUME_READY_QUIET_MS = parseInt(process.env.RESUME_READY_QUIET_MS || '800', 10);
+const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || '120000', 10);
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
@@ -1881,6 +1892,16 @@ function flushResponse(session) {
 function sendToSession(session, contentBlocks) {
   if (!session.alive || session._autoStopped) return false;
 
+  // Resume-hold gate: while a just-resumed iv session isn't input-ready yet,
+  // buffer outgoing messages instead of typing them into the still-loading
+  // TUI. The readiness watcher (startResumeReadyWatcher) flushes them, merged
+  // and in order, once claude is idle. See RESUME_READY_* above.
+  if (session._awaitingInputReady) {
+    (session._resumeOutbox ||= []).push(contentBlocks);
+    session.lastActivityAt = Date.now();
+    return true;
+  }
+
   session.lastActivityAt = Date.now();
   session.responseBuffer = '';
   session.toolCalls = [];
@@ -1941,6 +1962,95 @@ function sendToSession(session, contentBlocks) {
 
 function sendTextToSession(session, text) {
   return sendToSession(session, [{ type: 'text', text }]);
+}
+
+// Begin holding outgoing messages for a freshly-resumed iv session and start
+// watching for the moment claude is idle-and-ready to receive them. Called
+// from the auto-resume branch right after the PTY is spawned. No-op for
+// non-iv sessions (print mode feeds stdin JSON, which claude buffers fine).
+function enterResumeHold(session) {
+  if (!session.iv) return;
+  session._awaitingInputReady = true;
+  session._resumeOutbox = [];
+  // No typing indicator here: a resume may surface the "Resume from summary"
+  // picker, and showing "Claude is typing…" while we're actually asking the
+  // user a question reads wrong. The "Auto-resuming…" notice already conveys
+  // what's happening; the real send (on flush) starts typing normally.
+  startResumeReadyWatcher(session);
+}
+
+// Watch a resuming iv session's PTY output; once it goes quiet AND the screen
+// shows the idle input box, flush any held messages (merged, in order) via the
+// normal send path. A hard cap guarantees the held message is eventually sent
+// even if readiness is never cleanly detected — but it defers while a TUI
+// prompt (e.g. the resume-summary picker) is awaiting the user's answer, so
+// the held message is never typed into a menu.
+function startResumeReadyWatcher(session) {
+  const iv = session.iv;
+  if (!iv) return;
+  let buf = '';
+  let quietTimer = null;
+  let hardCap = null;
+  let settled = false;
+
+  const finish = (reason) => {
+    if (settled) return;
+    settled = true;
+    if (quietTimer) clearTimeout(quietTimer);
+    if (hardCap) clearTimeout(hardCap);
+    iv.removeListener('pty-data', onData);
+    session._awaitingInputReady = false;
+    const outbox = session._resumeOutbox || [];
+    session._resumeOutbox = null;
+    debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)`);
+    if (session.alive && outbox.length > 0) {
+      // Merge everything the user sent during the hold into a single turn.
+      // The gate is now disarmed, so this reaches the real send path.
+      sendToSession(session, outbox.flat());
+    } else {
+      // Nothing to send (or session died) — don't leave a typing indicator
+      // spinning with no turn behind it.
+      session.busy = false;
+      if (session.typingInterval) {
+        clearInterval(session.typingInterval);
+        session.typingInterval = null;
+        client.setTyping(session.roomId, false, 1000).catch(() => {});
+      }
+    }
+  };
+
+  const evaluate = () => {
+    if (settled || !session.alive) return finish('dead');
+    // A surfaced TUI prompt (e.g. the resume-summary picker) means claude
+    // wants a structured answer, not a free message — let the prompt flow
+    // handle it and keep holding; the user's answer produces more PTY data
+    // that re-arms this check.
+    if (session.pendingInteractivePrompt) return;
+    if (isIdleReadyScreen(buf)) finish('idle');
+  };
+
+  const onData = (data) => {
+    buf += data;
+    if (buf.length > 32768) buf = buf.slice(-32768);
+    if (quietTimer) clearTimeout(quietTimer);
+    quietTimer = setTimeout(evaluate, RESUME_READY_QUIET_MS);
+  };
+
+  const onHardCap = () => {
+    if (settled) return;
+    // If the user still hasn't answered a surfaced prompt, don't dump the
+    // held message into it — give them another window.
+    if (session.pendingInteractivePrompt) {
+      hardCap = setTimeout(onHardCap, RESUME_READY_HARDCAP_MS);
+      if (typeof hardCap.unref === 'function') hardCap.unref();
+      return;
+    }
+    finish('timeout');
+  };
+
+  hardCap = setTimeout(onHardCap, RESUME_READY_HARDCAP_MS);
+  if (typeof hardCap.unref === 'function') hardCap.unref();
+  iv.on('pty-data', onData);
 }
 
 function formatQueueSummary(queued) {
@@ -3446,6 +3556,10 @@ client.on('room.message', async (roomId, event) => {
       const shortId = prev.sessionId.slice(0, 8);
       const arNotice = notice('info', `Auto-resuming session ${shortId}…`, `Auto-resuming session <code>${shortId}</code>…`);
       await sendHtmlFn(arNotice.plain, arNotice.html);
+      // Hold this (and any further) message until the resumed TUI is ready —
+      // claude --resume + auto-compaction can take seconds, far longer than
+      // the paste→Enter window, so an immediate type-in is silently dropped.
+      enterResumeHold(session);
     } else {
       // Auto-start a session in this room
       const workdir = DEFAULT_WORKDIR;
