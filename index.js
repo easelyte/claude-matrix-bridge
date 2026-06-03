@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, knownMcpExtras } from './lib/mcp-config.js';
+import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, extractPromptFlag, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -3059,7 +3059,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(parts.slice(1));
+      // Parse --prompt from the RAW text FIRST (quote-aware), so flags inside a
+      // quoted prompt aren't consumed by the token extractors below. Only the
+      // !start case re-splits the prompt-stripped remainder; the top-level
+      // `parts` (shared by all commands) is untouched.
+      const { prompt: autoPrompt, rest: textSansPrompt, error: promptError } = extractPromptFlag(text);
+      if (promptError) { await sendReply(promptError); return; }
+      if (autoPrompt !== null && !INTERACTIVE_MODE) {
+        await sendReply('--prompt is only supported in interactive mode (MATRON_INTERACTIVE_MODE=1).');
+        return;
+      }
+      const startTokens = textSansPrompt.split(/\s+/).slice(1); // drop the "!start" token
+      const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(startTokens);
       const { worktree, error: worktreeError, rest: positional } = extractWorktreeFlag(afterExtras);
       if (worktreeError) {
         await sendReply(worktreeError);
