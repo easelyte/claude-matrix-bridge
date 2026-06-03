@@ -3084,12 +3084,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         workdir = resolved;
       }
 
-      // Reject --worktree in interactive mode before creating a room
-      if (worktree && INTERACTIVE_MODE) {
-        await sendReply('--worktree is not yet supported in interactive mode. Use print mode (MATRON_INTERACTIVE_MODE=0) for worktree sessions.');
-        return;
-      }
-
       // Check for duplicate worktree before creating a room (room creation is irreversible)
       if (worktree && isWorktreeInUse(worktree, workdir)) {
         await sendReply(`Worktree "${worktree}" is already in use by another session. Pick a different name.`);
@@ -3223,10 +3217,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       const effectiveWorktree = restartWorktree || existing.worktree || null;
-      if (effectiveWorktree && INTERACTIVE_MODE) {
-        await sendReply('--worktree is not yet supported in interactive mode.');
-        return;
-      }
       if (effectiveWorktree && isWorktreeInUse(effectiveWorktree, existing.workdir, roomId)) {
         await sendReply(`Worktree "${effectiveWorktree}" is already in use by another session.`);
         return;
@@ -3369,10 +3359,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
         : null);
       const effectiveResumeWorktree = resumePersisted?.worktree || null;
-      if (effectiveResumeWorktree && INTERACTIVE_MODE) {
-        await sendReply('Cannot resume a worktree session in interactive mode.');
-        return;
-      }
       if (effectiveResumeWorktree && isWorktreeInUse(effectiveResumeWorktree, actualWorkdir)) {
         await sendReply(`Worktree "${effectiveResumeWorktree}" is already in use by another session.`);
         return;
