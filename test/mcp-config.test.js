@@ -2,8 +2,48 @@ import { describe, it, expect } from 'vitest';
 import {
   buildMcpServers,
   extractMcpExtraFlags,
+  extractPromptFlag,
   knownMcpExtras,
 } from '../lib/mcp-config.js';
+
+describe('extractPromptFlag', () => {
+  it('extracts a quoted multi-word prompt and returns the rest verbatim', () => {
+    expect(extractPromptFlag('--worktree foo --prompt "do the thing now"'))
+      .toEqual({ prompt: 'do the thing now', rest: '--worktree foo', error: null });
+  });
+  it('does NOT consume flags inside the quoted prompt', () => {
+    expect(extractPromptFlag('--prompt "investigate --worktree x and --browser"'))
+      .toEqual({ prompt: 'investigate --worktree x and --browser', rest: '', error: null });
+  });
+  it('accepts a single unquoted token', () => {
+    expect(extractPromptFlag('--worktree foo --prompt hello'))
+      .toEqual({ prompt: 'hello', rest: '--worktree foo', error: null });
+  });
+  it('errors on an unterminated quote', () => {
+    const r = extractPromptFlag('--prompt "unterminated text');
+    expect(r.prompt).toBeNull();
+    expect(r.error).toMatch(/missing closing quote/);
+  });
+  it('honors backslash-escaped quotes inside the prompt', () => {
+    expect(extractPromptFlag('/repo --prompt "say \\"hello\\" then stop"'))
+      .toEqual({ prompt: 'say "hello" then stop', rest: '/repo', error: null });
+  });
+  it('rejects an empty quoted prompt (P8)', () => {
+    const r = extractPromptFlag('--worktree x --prompt ""');
+    expect(r.prompt).toBeNull();
+    expect(r.error).toMatch(/non-empty/);
+  });
+  it('returns null + unchanged rest when --prompt is absent', () => {
+    expect(extractPromptFlag('--worktree foo /dir'))
+      .toEqual({ prompt: null, rest: '--worktree foo /dir', error: null });
+  });
+  it('does NOT match --prompt as a substring (--prompted / --prompt-extra)', () => {
+    expect(extractPromptFlag('--worktree real --prompted'))
+      .toEqual({ prompt: null, rest: '--worktree real --prompted', error: null });
+    expect(extractPromptFlag('--prompt-extra foo'))
+      .toEqual({ prompt: null, rest: '--prompt-extra foo', error: null });
+  });
+});
 
 const BASE = Object.freeze({
   mcpServers: {

@@ -15,7 +15,7 @@ import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, knownMcpExtras } from './lib/mcp-config.js';
+import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, extractPromptFlag, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -529,6 +529,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
+        // Carry an undelivered --prompt across the restart (iv-mode only; undefined
+        // and harmless in print mode). The replacement keeps pendingWelcome=true, so
+        // a crash before the operator joins still fires the prompt on their join.
+        restarted.pendingAutoPrompt = session.pendingAutoPrompt;
         // Carry user-visible state across the restart so the user doesn't
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
@@ -704,6 +708,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pinnedSummaryText: '',
     pendingWelcome: true,
     pendingInteractivePrompt: null,
+    // Auto-injected prompt for --prompt dispatch (distinct from pendingInteractivePrompt,
+    // the TUI dialog). Set post-create by the !start handler; fired by the join handler
+    // (sendPendingWelcomeIfNeeded) once the operator joins and keys are shared.
+    pendingAutoPrompt: null,
     ivReady: false,
     ivPendingInput: null,
   };
@@ -716,6 +724,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       const pending = session.ivPendingInput;
       session.ivPendingInput = null;
       sendToSession(session, pending);
+    }
+    // Fire a join-armed auto-prompt AFTER draining any operator input, now that the
+    // TUI is ready (so it writes straight to the PTY, never into the single-slot
+    // ivPendingInput stash where it could be overwritten). Set by sendPendingWelcomeIfNeeded.
+    if (session._fireAutoPromptWhenReady) {
+      const fire = session._fireAutoPromptWhenReady;
+      session._fireAutoPromptWhenReady = null;
+      fire();
     }
   }
 
@@ -802,6 +818,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
+        // Carry an undelivered --prompt across the restart (iv-mode only; undefined
+        // and harmless in print mode). The replacement keeps pendingWelcome=true, so
+        // a crash before the operator joins still fires the prompt on their join.
+        restarted.pendingAutoPrompt = session.pendingAutoPrompt;
         // Carry user-visible state across the restart so the user doesn't
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
@@ -2102,7 +2122,11 @@ function sendToSession(session, contentBlocks) {
         if (session.resetTimeout) session.resetTimeout();
         return true;
       }
-      session.iv.sendText(text);
+      // Propagate a dead-PTY write failure: iv.sendText returns false when the
+      // PTY has exited (lib/interactive-session.js). Surfacing false lets callers
+      // (incl. the auto-prompt path's delivery check) detect a lost write instead
+      // of falsely reporting success.
+      if (session.iv.sendText(text) === false) return false;
       // Enter retry: after sending text, the 500ms delayed Enter may be
       // swallowed if the TUI has a transient hiccup. Watch for transcript
       // activity — if none arrives within 3s, retry Enter. Up to 2 retries.
@@ -3059,7 +3083,18 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(parts.slice(1));
+      // Parse --prompt from the RAW text FIRST (quote-aware), so flags inside a
+      // quoted prompt aren't consumed by the token extractors below. Only the
+      // !start case re-splits the prompt-stripped remainder; the top-level
+      // `parts` (shared by all commands) is untouched.
+      const { prompt: autoPrompt, rest: textSansPrompt, error: promptError } = extractPromptFlag(text);
+      if (promptError) { await sendReply(promptError); return; }
+      if (autoPrompt !== null && !INTERACTIVE_MODE) {
+        await sendReply('--prompt is only supported in interactive mode (MATRON_INTERACTIVE_MODE=1).');
+        return;
+      }
+      const startTokens = textSansPrompt.split(/\s+/).slice(1); // drop the "!start" token
+      const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(startTokens);
       const { worktree, error: worktreeError, rest: positional } = extractWorktreeFlag(afterExtras);
       if (worktreeError) {
         await sendReply(worktreeError);
@@ -3084,19 +3119,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         workdir = resolved;
       }
 
-      // Reject --worktree in interactive mode before creating a room
-      if (worktree && INTERACTIVE_MODE) {
-        await sendReply('--worktree is not yet supported in interactive mode. Use print mode (MATRON_INTERACTIVE_MODE=0) for worktree sessions.');
-        return;
-      }
-
       // Check for duplicate worktree before creating a room (room creation is irreversible)
       if (worktree && isWorktreeInUse(worktree, workdir)) {
         await sendReply(`Worktree "${worktree}" is already in use by another session. Pick a different name.`);
         return;
       }
 
-      // Create a new room for this session
+      // Create a new room for this session (encrypted per ENCRYPT_SESSION_ROOMS).
       let sessionRoomId;
       try {
         sessionRoomId = await createSessionRoom(sender);
@@ -3115,6 +3144,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
+      // --prompt dispatch: the queued prompt fires when the operator joins the new
+      // room (sendPendingWelcomeIfNeeded), after key-sharing — so the encrypted
+      // transcript is fully readable. Set after the callbacks are wired; join always
+      // happens later, so no construction race.
+      if (autoPrompt !== null) session.pendingAutoPrompt = autoPrompt;
       // In iv-mode claudeSessionId is known immediately, so persist mcpExtras
       // now — otherwise a bridge restart before the first transcript-driven
       // persist would lose the user's opt-in. Print-mode sessions get their
@@ -3123,11 +3157,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      // Confirm in origin room with a link to the new room
+      // Confirm in origin room with a link to the new room. R500: the queued-prompt
+      // note is CONTENT-FREE (length only) — never echo the prompt text back.
       const roomLink = `https://matrix.to/#/${sessionRoomId}`;
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
       const worktreeNote = worktree ? ` (worktree: ${worktree})` : '';
-      await sendReply(`Session started in new room: ${roomLink}${extrasNote}${worktreeNote}`);
+      const promptNote = autoPrompt !== null ? `\nPrompt queued (${autoPrompt.length} chars) — fires automatically when the session is ready.` : '';
+      await sendReply(`Session started in new room: ${roomLink}${extrasNote}${worktreeNote}${promptNote}`);
 
       // Welcome message will be sent when user joins (see room.join handler)
       break;
@@ -3223,10 +3259,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       const effectiveWorktree = restartWorktree || existing.worktree || null;
-      if (effectiveWorktree && INTERACTIVE_MODE) {
-        await sendReply('--worktree is not yet supported in interactive mode.');
-        return;
-      }
       if (effectiveWorktree && isWorktreeInUse(effectiveWorktree, existing.workdir, roomId)) {
         await sendReply(`Worktree "${effectiveWorktree}" is already in use by another session.`);
         return;
@@ -3369,10 +3401,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ? Object.values(loadPersistedSessions()).find(e => e.sessionId === resumeSessionId)
         : null);
       const effectiveResumeWorktree = resumePersisted?.worktree || null;
-      if (effectiveResumeWorktree && INTERACTIVE_MODE) {
-        await sendReply('Cannot resume a worktree session in interactive mode.');
-        return;
-      }
       if (effectiveResumeWorktree && isWorktreeInUse(effectiveResumeWorktree, actualWorkdir)) {
         await sendReply(`Worktree "${effectiveResumeWorktree}" is already in use by another session.`);
         return;
@@ -3757,6 +3785,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!start', 'Start a new session (creates a new room)'],
           ['!start &lt;workdir&gt;', 'Start in a specific directory'],
           ['!start --browser [workdir]', 'Also enable chrome-devtools MCP (~400M)'],
+          ['!start --worktree &lt;slug&gt; --prompt "…"', 'Dispatch a worktree session; the prompt fires automatically as your first message when you open the new room. Interactive-mode only.'],
           ['!esc', 'Interrupt current turn (jumps the queue)'],
           ['!clearall', 'Drop all queued messages'],
           ['!stop', 'Stop the current session'],
@@ -3977,8 +4006,11 @@ client.on('room.message', async (roomId, event) => {
 
   if (!text && !hasMedia) return;
 
+  // R500: redact any --prompt value before logging — this runs before command
+  // parsing, so a `!start --prompt "secret"` would otherwise leak into service logs.
+  const logText = text.replace(/--prompt\s+.*/s, '--prompt <redacted>');
   console.log(
-    `Message from ${sender} in ${roomId}: ${text.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
+    `Message from ${sender} in ${roomId}: ${logText.slice(0, 50)}${hasMedia ? ' [media]' : ''}`
   );
 
   const sendReply = (reply) => sendToRoom(roomId, plainTextFormat(reply), markdownToHtml(reply));
@@ -4471,6 +4503,18 @@ client.on('room.message', async (roomId, event) => {
 
 // --- Room Membership Handler ---
 
+// Build the standard "Session started" welcome strings. Shared by the
+// join-path welcome (below) and the --prompt injection path (markIvReady), so
+// both render the same banner.
+function buildWelcome(workdir) {
+  const plain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
+  const html =
+    `<b>Session started</b><br/>` +
+    `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
+    `<i>Send any message to interact with Claude Code.</i>`;
+  return { plain, html };
+}
+
 async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
   const session = sessions.get(roomId);
   if (!session || !session.pendingWelcome) return;
@@ -4483,15 +4527,55 @@ async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
   // Let the crypto room tracker process the join before sharing the room key.
   await new Promise(r => setTimeout(r, 500));
 
-  const workdir = session.workdir;
-  const welcomePlain = `Session started.\nWorkdir: ${workdir}\n\nSend any message to interact with Claude Code.`;
-  const welcomeHtml =
-    `<b>Session started</b><br/>` +
-    `Workdir: <code>${escapeHtml(workdir)}</code><br/><br/>` +
-    `<i>Send any message to interact with Claude Code.</i>`;
+  const { plain: welcomePlain, html: welcomeHtml } = buildWelcome(session.workdir);
 
+  // Wrap the welcome send so a transient failure can't strand the queued prompt
+  // below (pendingWelcome is already false, so this handler won't run again).
   if (session.sendHtml) {
-    await session.sendHtml(welcomePlain, welcomeHtml);
+    try { await session.sendHtml(welcomePlain, welcomeHtml); }
+    catch (e) { debug(`[IV] welcome send failed: ${e.message}`); }
+  }
+
+  // --prompt dispatch: now that the operator has joined and keys are shared, fire
+  // the queued prompt as their first message. Deliver ONLY when the TUI is ready,
+  // so it writes straight to the PTY rather than into the single-slot ivPendingInput
+  // stash (which a fast operator message could overwrite). Echo/persist happen only
+  // after a real delivery. If the TUI isn't ready yet, arm markIvReady to fire it
+  // after it drains any operator input.
+  if (session.pendingAutoPrompt) {
+    const fireAutoPrompt = async () => {
+      const promptText = session.pendingAutoPrompt;
+      if (!promptText) return;
+      session.pendingAutoPrompt = null;
+      // Operator-override: if the operator already sent a first message (set whether
+      // it was delivered or stashed), it wins — skip the auto-prompt entirely rather
+      // than deliver a second message back-to-back (which the paste→delayed-Enter
+      // model could merge/reorder). Their message is already in the room + the PTY.
+      if (session.firstMessageCaptured) return;
+      if (sendToSession(session, [{ type: 'text', text: promptText }]) === false) {
+        if (session.sendCallback) session.sendCallback('⚠️ Queued prompt could not be delivered — the session is unavailable. Send it manually.');
+        return;
+      }
+      // The room is encrypted and the operator is present, so echoing the prompt
+      // for transcript context is fine. Only after a confirmed (non-stashed) write.
+      if (session.sendHtml) {
+        try { await session.sendHtml(`> ${promptText}`, `<blockquote>${escapeHtml(promptText)}</blockquote>`); }
+        catch (e) { debug(`[IV] prompt echo failed: ${e.message}`); }
+      }
+      if (!session.chatHistory) session.chatHistory = [];
+      session.chatHistory.push({ role: 'user', text: promptText });
+      if (session.claudeSessionId) {
+        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+      }
+      if (!session.firstMessageCaptured) {
+        session.firstMessageCaptured = true;
+        // Name from the non-secret worktree slug (no Gemini call on prompt content).
+        const short = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+        if (session.worktree) updateRoomName(session.roomId, `${SERVER_LABEL}:${short} ${session.worktree}`);
+      }
+    };
+    if (session.ivReady) await fireAutoPrompt();
+    else session._fireAutoPromptWhenReady = fireAutoPrompt;
   }
 }
 
