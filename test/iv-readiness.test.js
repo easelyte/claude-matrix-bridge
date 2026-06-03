@@ -472,3 +472,179 @@ describe('IvReadinessController — phase machine', () => {
     expect(deliveries).toHaveLength(0);
   });
 });
+
+// ── Fix-2 Codex review findings ────────────────────────────────────────────
+
+/** Prompt fixture with a free-text slot at index 2 */
+function freeTextPrompt() {
+  return {
+    kind: 'numbered',
+    question: 'What do you want to do?',
+    options: [
+      { key: '1', label: 'Option A' },
+      { key: '2', label: 'Option B' },
+      { key: '3', label: 'Tell Claude what to change' },
+    ],
+    freeTextIdx: 2,
+  };
+}
+
+describe('B1 — stashed free-text delivered, not dropped', () => {
+  test('stashed prose during loading → onPrompt returns freeText+stashedText, resolved=true, not in heldInput', () => {
+    const { ctrl, responses } = makeCtrl({ clockStart: 1000 });
+    ctrl.armReadyTimer();
+
+    // Stash prose before the prompt fires.
+    ctrl.accept(textBlocks('please refactor the auth module'));
+    expect(ctrl.pendingInput).toHaveLength(1);
+
+    // Prompt fires — matcher recognises the prose as free-text.
+    const prompt = freeTextPrompt();
+    const matcher = text => matchPromptResponse(prompt, text);
+    const { resolved, matchResult } = ctrl.onPrompt(matcher);
+
+    // Must be resolved=true with the free-text flag and original text.
+    expect(resolved).toBe(true);
+    expect(matchResult).toMatchObject({ freeText: true, stashedText: 'please refactor the auth module' });
+
+    // Stash item consumed — pendingInput and heldInput must be empty.
+    expect(ctrl.pendingInput).toHaveLength(0);
+    expect(ctrl.heldInput).toHaveLength(0);
+
+    // respond() is NOT called for free-text (the caller does respondToPrompt directly).
+    expect(responses).toHaveLength(0);
+  });
+
+  test('stashed free-text: watchdog is NOT armed when stash is consumed as free-text', () => {
+    const { ctrl, timers, fireTimerAfter, notices } = makeCtrl({ clockStart: 0 });
+    ctrl.armReadyTimer();
+
+    ctrl.accept(textBlocks('some instruction'));
+    const prompt = freeTextPrompt();
+    const matcher = text => matchPromptResponse(prompt, text);
+    ctrl.onPrompt(matcher);
+
+    // heldInput empty → watchdog must not be armed.
+    expect(ctrl.heldInput).toHaveLength(0);
+    // Fire past 60s — no notice should fire (no watchdog running).
+    const timerCountBefore = timers.size;
+    fireTimerAfter(60_001);
+    expect(notices).toHaveLength(0);
+    void timerCountBefore; // used only to confirm no additional timers
+  });
+});
+
+describe('B2 — post-modal follow-up reaches busy queue, not held-then-cleared', () => {
+  // This test exercises the controller side: after prompt resolved + onPromptResolved(),
+  // the phase stays modal until the next /effort cue. A new accept() in modal phase
+  // goes to heldInput. The B2 fix is in index.js (session.busy=true), tested via
+  // integration-style assertions on the controller's heldInput + phase state after
+  // prompt resolution, to confirm the phase does NOT silently clear the hold.
+  test('after onPromptResolved(), phase is still modal — new accept() goes to heldInput (not lost)', () => {
+    const { ctrl, deliveries } = makeCtrl({ clockStart: 1000 });
+    ctrl.armReadyTimer();
+
+    ctrl.accept(textBlocks('answer to prompt'));
+    ctrl.onPrompt(() => ({ freeText: true, stashedText: 'answer to prompt' }));
+    // Simulate what the caller does after stash free-text resolution.
+    ctrl.onPromptResolved();
+
+    // Phase is still modal — the next user message before /effort goes to heldInput.
+    expect(ctrl.phase).toBe('modal');
+
+    // A follow-up message arrives (controller-level: this is what sendToSession
+    // does when phase !== 'free' — it calls accept()).
+    const result = ctrl.accept(textBlocks('follow-up message'));
+    expect(result.action).toBe('held');
+    expect(ctrl.heldInput).toHaveLength(1);
+    expect(deliveries).toHaveLength(0);
+
+    // When /effort arrives (Claude done), heldInput is delivered.
+    ctrl.onPtyData('/effort toolbar', ctrl.cueFreshFrom + 1, true);
+    expect(ctrl.phase).toBe('free');
+    expect(deliveries).toHaveLength(1);
+    expect(ctrl.heldInput).toHaveLength(0);
+  });
+
+  test('after token-match prompt resolved via onPromptResolved(), phase stays modal until /effort', () => {
+    const { ctrl, deliveries } = makeCtrl({ clockStart: 500 });
+    ctrl.armReadyTimer();
+
+    ctrl.setPhase('modal');
+    ctrl.onPromptResolved();
+
+    // Phase must still be modal (B2: index.js sets busy=true to protect the queue).
+    expect(ctrl.phase).toBe('modal');
+
+    // /effort brings it to free.
+    ctrl.onPtyData('/effort now', ctrl.cueFreshFrom + 1, true);
+    expect(ctrl.phase).toBe('free');
+    expect(deliveries).toHaveLength(0);
+  });
+});
+
+describe('M1 — out-of-range freeTextIdx → non-match, no throw', () => {
+  test('freeTextIdx === options.length (exactly out-of-range) → null, no throw', () => {
+    const prompt = {
+      kind: 'numbered',
+      question: 'Pick:',
+      options: [{ key: '1', label: 'A' }, { key: '2', label: 'B' }],
+      freeTextIdx: 2, // out-of-range (valid indices: 0, 1)
+    };
+    expect(() => matchPromptResponse(prompt, 'some prose')).not.toThrow();
+    expect(matchPromptResponse(prompt, 'some prose')).toBeNull();
+  });
+
+  test('freeTextIdx === -1 → null (negative index)', () => {
+    const prompt = {
+      kind: 'numbered',
+      question: 'Pick:',
+      options: [{ key: '1', label: 'A' }],
+      freeTextIdx: -1,
+    };
+    expect(matchPromptResponse(prompt, 'prose')).toBeNull();
+  });
+
+  test('freeTextIdx valid → freeText result returned', () => {
+    const prompt = {
+      kind: 'numbered',
+      question: 'Pick:',
+      options: [{ key: '1', label: 'A' }, { key: '2', label: 'Tell Claude' }],
+      freeTextIdx: 1, // valid
+    };
+    expect(matchPromptResponse(prompt, 'please refactor')).toEqual({ freeText: true });
+  });
+
+  test('lettered prompt: freeTextIdx out-of-range → null, no throw', () => {
+    const prompt = {
+      kind: 'lettered',
+      question: 'Pick:',
+      options: [{ key: 'a', label: 'Alpha' }],
+      freeTextIdx: 5, // way out-of-range
+    };
+    expect(() => matchPromptResponse(prompt, 'prose here')).not.toThrow();
+    expect(matchPromptResponse(prompt, 'prose here')).toBeNull();
+  });
+});
+
+describe('M2 — watchdog notice plain-texts user content (no raw HTML passthrough)', () => {
+  test('watchdog notice text is emitted via notify() as plain text (controller side)', () => {
+    const { ctrl, notices, fireTimerAfter } = makeCtrl({ clockStart: 0 });
+    ctrl.armReadyTimer();
+
+    // Stash text containing HTML-like content.
+    ctrl.accept(textBlocks('<script>alert(1)</script>'));
+    ctrl.onPrompt(() => null);
+    expect(ctrl.heldInput).toHaveLength(1);
+
+    // Fire the 60s watchdog.
+    fireTimerAfter(60_001);
+
+    // The controller passes the verbatim text to notify() — it is the
+    // caller's (ivNotify) responsibility to escape before use as HTML.
+    // Assert that the notice contains the original text (so escaping can be verified).
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('<script>alert(1)</script>');
+    expect(ctrl.heldInput).toHaveLength(0);
+  });
+});

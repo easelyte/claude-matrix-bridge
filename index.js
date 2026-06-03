@@ -702,8 +702,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   }
 
   // Inject a notify helper that uses the session's Matrix output channel.
+  // The plain-text body may contain verbatim user input — always HTML-escape
+  // it for the HTML branch so user content can't inject markup (M2 fix).
   function ivNotify(text) {
-    if (session.sendHtml) session.sendHtml(text, text);
+    if (session.sendHtml) session.sendHtml(text, escapeHtml(text));
     else if (session.sendCallback) session.sendCallback(text);
   }
 
@@ -770,38 +772,67 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     const { resolved, matchResult } = ctrl.onPrompt(text => matchPromptResponse(prompt, text));
 
     if (resolved && matchResult) {
-      // Bare token resolved — send Matrix confirmation (P3 Fail Visible).
-      // matchResult is {kind, key}; translate to a human-readable label.
-      let pickedLabel = null;
-      let pickedNumber = null;
-      const key = matchResult.key;
-      if (prompt.kind === 'yes-no') {
-        pickedLabel = key === 'y' ? 'Yes' : 'No';
-      } else if (prompt.kind === 'numbered' || prompt.kind === 'lettered' || prompt.kind === 'arrow-menu') {
-        const n = Number(key);
-        if (prompt.kind === 'arrow-menu') {
-          pickedNumber = n + 1;
-          pickedLabel = prompt.options[n]?.label ?? key;
-        } else {
-          const opt = prompt.options.find(o => o.key === key);
-          pickedLabel = opt ? opt.label : key;
-          const idx = prompt.options.indexOf(opt);
-          if (idx >= 0) pickedNumber = idx + 1;
+      if (matchResult.freeText) {
+        // Stashed free-text: navigate to the free-text slot and paste the
+        // original text — mirrors the live reply path in maybeResolveInteractivePrompt
+        // so the stashed instruction actually reaches Claude (B1 fix).
+        const idx = prompt.freeTextIdx;
+        const opt = prompt.options[idx];
+        const ftResponse = prompt.kind === 'arrow-menu'
+          ? { kind: 'arrow-menu', key: String(idx) }
+          : { kind: prompt.kind, key: opt.key };
+        session.pendingInteractivePrompt = null;
+        ctrl.onPromptResolved();
+        session.iv.respondToPrompt(ftResponse);
+        const stashedText = matchResult.stashedText || '';
+        setTimeout(() => {
+          if (session.iv && session.iv.alive) {
+            session.iv.sendText(stashedText);
+          }
+        }, 250);
+        // Set busy so follow-up messages queue durably (B2 fix for stash path).
+        session.busy = true;
+        if (session.typingInterval) clearInterval(session.typingInterval);
+        session.typingInterval = startTyping(session.roomId);
+      } else {
+        // Bare token resolved — send Matrix confirmation (P3 Fail Visible).
+        // matchResult is {kind, key}; translate to a human-readable label.
+        let pickedLabel = null;
+        let pickedNumber = null;
+        const key = matchResult.key;
+        if (prompt.kind === 'yes-no') {
+          pickedLabel = key === 'y' ? 'Yes' : 'No';
+        } else if (prompt.kind === 'numbered' || prompt.kind === 'lettered' || prompt.kind === 'arrow-menu') {
+          const n = Number(key);
+          if (prompt.kind === 'arrow-menu') {
+            pickedNumber = n + 1;
+            pickedLabel = prompt.options[n]?.label ?? key;
+          } else {
+            const opt = prompt.options.find(o => o.key === key);
+            pickedLabel = opt ? opt.label : key;
+            const idx = prompt.options.indexOf(opt);
+            if (idx >= 0) pickedNumber = idx + 1;
+          }
         }
+        const numberPrefix = pickedNumber !== null ? `${pickedNumber}. ` : '';
+        const ackPlain = `→ Sent "${numberPrefix}${pickedLabel || key}" to Claude`;
+        const ackHtml = `<i>→ Sent <b>${escapeHtml(numberPrefix + (pickedLabel || key))}</b> to Claude</i>`;
+        if (session.sendHtml && session.sendCallback) {
+          session.sendHtml(ackPlain, ackHtml);
+        } else if (session.sendHtml) {
+          session.sendHtml(ackPlain, ackHtml);
+        } else if (session.sendCallback) {
+          session.sendCallback(ackPlain);
+        }
+        // Prompt resolved by the stash — clear pendingInteractivePrompt.
+        session.pendingInteractivePrompt = null;
+        ctrl.onPromptResolved();
+        // Set busy so post-resolution follow-ups queue durably rather than
+        // falling into the held-input + watchdog path (B2 fix).
+        session.busy = true;
+        if (session.typingInterval) clearInterval(session.typingInterval);
+        session.typingInterval = startTyping(session.roomId);
       }
-      const numberPrefix = pickedNumber !== null ? `${pickedNumber}. ` : '';
-      const ackPlain = `→ Sent "${numberPrefix}${pickedLabel || key}" to Claude`;
-      const ackHtml = `<i>→ Sent <b>${escapeHtml(numberPrefix + (pickedLabel || key))}</b> to Claude</i>`;
-      if (session.sendHtml && session.sendCallback) {
-        session.sendHtml(ackPlain, ackHtml);
-      } else if (session.sendHtml) {
-        session.sendHtml(ackPlain, ackHtml);
-      } else if (session.sendCallback) {
-        session.sendCallback(ackPlain);
-      }
-      // Prompt resolved by the stash — clear pendingInteractivePrompt.
-      session.pendingInteractivePrompt = null;
-      ctrl.onPromptResolved();
     }
 
     // A TUI prompt means claude has stopped processing and is awaiting
@@ -1041,7 +1072,17 @@ function maybeResolveInteractivePrompt(session, userText) {
   if (result.freeText) {
     // Free-text slot: navigate to it and send the prose into the text field.
     const idx = p.freeTextIdx;
-    const opt = p.options[idx];
+    // Guard against out-of-range freeTextIdx (M1 fix — matchPromptResponse already
+    // bounds-checks, but guard here too so opt dereference never throws).
+    const opt = (typeof idx === 'number' && idx >= 0 && idx < p.options.length)
+      ? p.options[idx]
+      : null;
+    if (!opt && p.kind !== 'arrow-menu') {
+      // No valid free-text option — treat as non-match and hold.
+      debug(`[IV] freeTextIdx=${idx} out of range (${p.options.length} options) — holding`);
+      if (session._ivCtrl) session._ivCtrl.accept([{ type: 'text', text: userText }]);
+      return true;
+    }
     const ftResponse = p.kind === 'arrow-menu'
       ? { kind: 'arrow-menu', key: String(idx) }
       : { kind: p.kind, key: opt.key };
@@ -1054,6 +1095,11 @@ function maybeResolveInteractivePrompt(session, userText) {
         session.iv.sendText(userText);
       }
     }, 250);
+    // Set busy so follow-up messages queue durably rather than falling into
+    // the held-input + watchdog path while Claude processes the answer (B2 fix).
+    session.busy = true;
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
     return true;
   }
 
@@ -1098,6 +1144,10 @@ function maybeResolveInteractivePrompt(session, userText) {
   if (session.sendHtml) session.sendHtml(ackPlain, ackHtml);
   else if (session.sendCallback) session.sendCallback(ackPlain);
 
+  // Set busy so follow-up messages queue durably rather than falling into the
+  // held-input + watchdog path while Claude processes the answer (B2 fix).
+  // onTurnEnd clears busy and flushes the queue when Claude's reply arrives.
+  session.busy = true;
   // Start typing while we wait for claude's next render.
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
