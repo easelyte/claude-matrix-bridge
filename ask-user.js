@@ -11,7 +11,9 @@ import { z } from 'zod';
 const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
-const POLL_TIMEOUT_MS = 300000; // 5 min max wait
+const ASK_USER_TIMEOUT_MS = 1800000; // 30 min — fallback only; the poller normally uses the bridge's timeoutMs from POST /ask. Used only if an older bridge omits it.
+const POLL_FALLBACK_GRACE_MS = 120000; // 2 min grace past the bridge window before the poller gives up on an unresponsive bridge
+const SECRET_TIMEOUT_MS = 300000;    // 5 min max wait for secret submission
 
 const server = new McpServer({
   name: 'ask-user',
@@ -44,10 +46,19 @@ server.tool(
         return { content: [{ type: 'text', text: `Error posting question: ${err}` }] };
       }
 
-      const { questionId } = await postRes.json();
+      const postData = await postRes.json();
+      const { questionId } = postData;
 
-      // Poll for answer
-      const deadline = Date.now() + POLL_TIMEOUT_MS;
+      // The bridge owns the expiry timer (set in POST /ask) and is
+      // authoritative for both outcomes — we just report its decision. It
+      // returns its configured timeout so we stay in sync; fall back to our
+      // local default only if an older bridge omits it. Our own deadline sits
+      // a short grace past the bridge window — purely a safety net for a
+      // bridge that never responds (crashed, or older code with no `expired`).
+      const bridgeTimeoutMs = Number(postData.timeoutMs) > 0 ? Number(postData.timeoutMs) : ASK_USER_TIMEOUT_MS;
+      const timeoutMin = Math.max(1, Math.round(bridgeTimeoutMs / 60000));
+      const timeoutText = `Question timed out — no answer received within ${timeoutMin} minutes.`;
+      const deadline = Date.now() + bridgeTimeoutMs + POLL_FALLBACK_GRACE_MS;
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
 
@@ -58,9 +69,14 @@ server.tool(
         if (data.answered) {
           return { content: [{ type: 'text', text: data.answer }] };
         }
+        if (data.expired) {
+          return { content: [{ type: 'text', text: timeoutText }] };
+        }
       }
 
-      return { content: [{ type: 'text', text: 'Question timed out — no answer received within 5 minutes.' }] };
+      // Safety fallback: the bridge never reported answered or expired (likely
+      // unreachable). Report a timeout so the tool call does not hang forever.
+      return { content: [{ type: 'text', text: timeoutText }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -89,7 +105,7 @@ server.tool(
       const { secretId } = await postRes.json();
 
       // Poll for the secret to be submitted
-      const deadline = Date.now() + POLL_TIMEOUT_MS;
+      const deadline = Date.now() + SECRET_TIMEOUT_MS;
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
 
