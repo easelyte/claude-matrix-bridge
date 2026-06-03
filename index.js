@@ -18,6 +18,7 @@ import { extractUrls } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { IvReadinessController, matchPromptResponse } from './lib/iv-readiness.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
@@ -693,31 +694,59 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pinnedSummaryText: '',
     pendingWelcome: true,
     pendingInteractivePrompt: null,
-    ivReady: false,
-    ivPendingInput: null,
   };
 
-  function markIvReady() {
-    if (session.ivReady) return;
-    session.ivReady = true;
-    debug(`[IV] Session marked ready, pending input: ${!!session.ivPendingInput}`);
-    if (session.ivPendingInput) {
-      const pending = session.ivPendingInput;
-      session.ivPendingInput = null;
-      sendToSession(session, pending);
-    }
+  // Build the content-block → text extractor (same logic as sendToSession uses).
+  function blocksToText(blocks) {
+    return blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
   }
 
-  let _ivPtyBuf = '';
+  // Inject a notify helper that uses the session's Matrix output channel.
+  function ivNotify(text) {
+    if (session.sendHtml) session.sendHtml(text, text);
+    else if (session.sendCallback) session.sendCallback(text);
+  }
+
+  // Construct the readiness controller for this session.
+  const ctrl = IvReadinessController({
+    deliver(blocks) {
+      // Convert content-blocks to text and type into the PTY (same as
+      // sendToSession's iv-mode path, but post-readiness, no re-stash).
+      const text = blocksToText(blocks);
+      if (text && session.iv && session.iv.alive) {
+        session.iv.sendText(text);
+      }
+    },
+    respond(response) {
+      if (session.iv && session.iv.alive) session.iv.respondToPrompt(response);
+    },
+    notify: ivNotify,
+    setTimer: (ms, fn) => {
+      const h = setTimeout(fn, ms);
+      if (typeof h.unref === 'function') h.unref();
+      return h;
+    },
+    clearTimer: h => clearTimeout(h),
+    clock: Date.now,
+  });
+
+  // Expose ivReady as a live derived getter so existing read sites work.
+  Object.defineProperty(session, 'ivReady', {
+    get() { return ctrl.phase !== 'loading'; },
+    enumerable: true,
+    configurable: true,
+  });
+
+  // Store the controller on the session so killSession can call dispose().
+  session._ivCtrl = ctrl;
+
+  // Arm the 30s readiness timer via the controller (it owns the timer).
+  ctrl.armReadyTimer();
+
   iv.on('pty-data', chunk => {
-    if (session.ivReady) return;
-    _ivPtyBuf += chunk;
-    if (_ivPtyBuf.length > 4096) _ivPtyBuf = _ivPtyBuf.slice(-2048);
-    if (_ivPtyBuf.includes('/effort')) {
-      debug('[IV] Detected toolbar in PTY output — TUI is ready');
-      _ivPtyBuf = '';
-      markIvReady();
-    }
+    const now = Date.now();
+    const promptResolved = session.pendingInteractivePrompt == null;
+    ctrl.onPtyData(chunk, now, promptResolved);
   });
 
   iv.on('event', event => {
@@ -732,8 +761,49 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
-    markIvReady();
+    // Set the pending prompt BEFORE calling onPrompt so the matcher below
+    // can reference it and the modal gate is live immediately.
     session.pendingInteractivePrompt = prompt;
+
+    // Transition to modal phase; drain the FIFO via the controller.
+    // The matcher resolves a bare-token first item and returns what was resolved.
+    const { resolved, matchResult } = ctrl.onPrompt(text => matchPromptResponse(prompt, text));
+
+    if (resolved && matchResult) {
+      // Bare token resolved — send Matrix confirmation (P3 Fail Visible).
+      // matchResult is {kind, key}; translate to a human-readable label.
+      let pickedLabel = null;
+      let pickedNumber = null;
+      const key = matchResult.key;
+      if (prompt.kind === 'yes-no') {
+        pickedLabel = key === 'y' ? 'Yes' : 'No';
+      } else if (prompt.kind === 'numbered' || prompt.kind === 'lettered' || prompt.kind === 'arrow-menu') {
+        const n = Number(key);
+        if (prompt.kind === 'arrow-menu') {
+          pickedNumber = n + 1;
+          pickedLabel = prompt.options[n]?.label ?? key;
+        } else {
+          const opt = prompt.options.find(o => o.key === key);
+          pickedLabel = opt ? opt.label : key;
+          const idx = prompt.options.indexOf(opt);
+          if (idx >= 0) pickedNumber = idx + 1;
+        }
+      }
+      const numberPrefix = pickedNumber !== null ? `${pickedNumber}. ` : '';
+      const ackPlain = `→ Sent "${numberPrefix}${pickedLabel || key}" to Claude`;
+      const ackHtml = `<i>→ Sent <b>${escapeHtml(numberPrefix + (pickedLabel || key))}</b> to Claude</i>`;
+      if (session.sendHtml && session.sendCallback) {
+        session.sendHtml(ackPlain, ackHtml);
+      } else if (session.sendHtml) {
+        session.sendHtml(ackPlain, ackHtml);
+      } else if (session.sendCallback) {
+        session.sendCallback(ackPlain);
+      }
+      // Prompt resolved by the stash — clear pendingInteractivePrompt.
+      session.pendingInteractivePrompt = null;
+      ctrl.onPromptResolved();
+    }
+
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
     // first-run modals, /login, unauthenticated "please run /login"
@@ -748,7 +818,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         client.setTyping(session.roomId, false, 1000).catch(() => {});
       }
     }
-    handleInteractivePrompt(session, prompt);
+
+    // If not already resolved by the stash, surface the prompt to Matrix.
+    if (!resolved) {
+      handleInteractivePrompt(session, prompt);
+    }
   });
 
   iv.on('parseError', err => {
@@ -886,13 +960,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
   };
 
-  const readyTimer = setTimeout(() => {
-    if (!session.ivReady) {
-      debug('[IV] Readiness timeout (30s) — forcing ready');
-      markIvReady();
-    }
-  }, 30000);
-  if (typeof readyTimer.unref === 'function') readyTimer.unref();
+  // The 30s readiness timer is owned and armed by the controller (ctrl.armReadyTimer()
+  // was called above). Do NOT add a second setTimeout here.
 
   // Subagent activity watcher — see createSession() for the rationale.
   session.subagentWatcher = new SubagentWatcher({ workdir: cwd, sessionId, worktreeName });
@@ -952,86 +1021,84 @@ function handleInteractivePrompt(session, prompt) {
 function maybeResolveInteractivePrompt(session, userText) {
   const p = session.pendingInteractivePrompt;
   if (!p) return false;
-  const trimmed = (userText || '').trim().toLowerCase();
-  let response = null;
-  if (p.kind === 'yes-no') {
-    if (/^(y|yes|1)$/.test(trimmed)) response = { kind: 'yes-no', key: 'y' };
-    else if (/^(n|no|2)$/.test(trimmed)) response = { kind: 'yes-no', key: 'n' };
-  } else {
-    const n = parseInt(trimmed, 10);
-    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
-      const opt = p.options[n - 1];
-      if (p.kind === 'arrow-menu') {
-        response = { kind: 'arrow-menu', key: String(n - 1) };
-      } else {
-        response = { kind: p.kind, key: opt.key };
-      }
-    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
-      response = { kind: 'lettered', key: trimmed };
+
+  // Use the shared pure helper with ANCHORED EXACT token matching.
+  // This intentionally changes numbered matching from parseInt-prefix to exact:
+  // "2 do X" no longer auto-selects option 2 (Goal 2 — never auto-select from free text).
+  const result = matchPromptResponse(p, userText);
+
+  if (!result) {
+    // No exact-token match and no free-text slot.
+    // Hold the message in heldInput — do NOT clear pendingInteractivePrompt and
+    // do NOT type anything. The modal stays up for the operator to answer.
+    debug(`[IV] Non-matching reply while modal pending — holding: "${(userText || '').slice(0, 60)}"`);
+    if (session._ivCtrl) {
+      session._ivCtrl.accept([{ type: 'text', text: userText }]);
     }
+    return true; // consumed — don't forward as a regular message
   }
-  if (!response) {
-    // No numeric/letter match. If the prompt has a free-text slot (e.g.
-    // "Tell Claude what to change"), select that option and pipe the
-    // user's text into the TUI's text input. Otherwise, ask the user to
-    // retry with a valid option.
-    if (typeof p.freeTextIdx === 'number' && p.freeTextIdx >= 0 && p.freeTextIdx < p.options.length) {
-      const idx = p.freeTextIdx;
-      const opt = p.options[idx];
-      const ftResponse = p.kind === 'arrow-menu'
-        ? { kind: 'arrow-menu', key: String(idx) }
-        : { kind: p.kind, key: opt.key };
-      session.pendingInteractivePrompt = null;
-      session.iv.respondToPrompt(ftResponse);
-      // Give the TUI a beat to transition from the menu into the text
-      // input area, then paste the user's reply (sendText handles the
-      // bracketed-paste + delayed Enter dance).
-      setTimeout(() => {
-        if (session.iv && session.iv.alive) {
-          session.iv.sendText(userText);
-        }
-      }, 250);
-      return true;
-    }
-    // Unmatched reply: dismiss the prompt and let the message through to
-    // Claude as normal input. This prevents false-positive detections from
-    // blocking the user's free-form messages.
+
+  if (result.freeText) {
+    // Free-text slot: navigate to it and send the prose into the text field.
+    const idx = p.freeTextIdx;
+    const opt = p.options[idx];
+    const ftResponse = p.kind === 'arrow-menu'
+      ? { kind: 'arrow-menu', key: String(idx) }
+      : { kind: p.kind, key: opt.key };
     session.pendingInteractivePrompt = null;
-    return false;
+    if (session._ivCtrl) session._ivCtrl.onPromptResolved();
+    session.iv.respondToPrompt(ftResponse);
+    // Give the TUI a beat to open the text input, then paste the prose.
+    setTimeout(() => {
+      if (session.iv && session.iv.alive) {
+        session.iv.sendText(userText);
+      }
+    }, 250);
+    return true;
   }
-  // Resolve the human-readable label so the Matrix confirmation tells the
-  // user *what* we sent to claude — without this, the bridge silently
-  // consumed the reply and the user thought it had been ignored.
+
+  // Exact-token match — resolve the prompt.
+  const response = result; // {kind, key}
+  const trimmed = (userText || '').trim().toLowerCase();
+
+  // Build human-readable label for the Matrix confirmation (P3 Fail Visible).
   let pickedLabel = null;
   let pickedNumber = null;
   if (p.kind === 'yes-no') {
     pickedLabel = response.key === 'y' ? 'Yes' : 'No';
+  } else if (p.kind === 'arrow-menu') {
+    const idx = Number(response.key);
+    pickedNumber = idx + 1;
+    pickedLabel = p.options[idx]?.label ?? response.key;
   } else {
-    const n = parseInt(trimmed, 10);
-    if (Number.isFinite(n) && n >= 1 && n <= p.options.length) {
+    // numbered / lettered
+    if (/^\d{1,2}$/.test(trimmed)) {
+      const n = Number(trimmed);
       pickedNumber = n;
-      pickedLabel = p.options[n - 1].label;
-    } else if (p.kind === 'lettered' && /^[a-z]$/.test(trimmed)) {
+      pickedLabel = p.options[n - 1]?.label ?? response.key;
+    } else if (/^[a-z]$/.test(trimmed)) {
       const opt = p.options.find(o => o.key === trimmed);
       pickedLabel = opt ? opt.label : trimmed.toUpperCase();
     }
   }
+
   session.pendingInteractivePrompt = null;
+  if (session._ivCtrl) session._ivCtrl.onPromptResolved();
   console.log(
     `[IV-DEBUG] Resolving TUI prompt with reply="${userText}" → ` +
     `kind=${response.kind} key=${response.key}` +
     (pickedLabel ? ` label="${pickedLabel}"` : '')
   );
   session.iv.respondToPrompt(response);
-  // Tell the Matrix user we received their reply and what we sent on
-  // their behalf. Without this the consumption is invisible.
+
+  // Matrix confirmation — let the user know what was sent.
   const numberPrefix = pickedNumber !== null ? `${pickedNumber}. ` : '';
   const ackPlain = `→ Sent "${numberPrefix}${pickedLabel || response.key}" to Claude`;
   const ackHtml = `<i>→ Sent <b>${escapeHtml(numberPrefix + (pickedLabel || response.key))}</b> to Claude</i>`;
   if (session.sendHtml) session.sendHtml(ackPlain, ackHtml);
   else if (session.sendCallback) session.sendCallback(ackPlain);
-  // Start typing while we wait for claude's next render — without this
-  // the user sees no activity until the next prompt or text fires.
+
+  // Start typing while we wait for claude's next render.
   if (session.typingInterval) clearInterval(session.typingInterval);
   session.typingInterval = startTyping(session.roomId);
   return true;
@@ -2071,13 +2138,13 @@ function sendToSession(session, contentBlocks) {
     }
     const text = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
     if (text) {
-      // Gate on TUI readiness: the PTY swallows Enter keystrokes during
-      // the resume/init window (before the toolbar renders). Stash the
-      // content blocks and let markIvReady() call sendToSession() once
-      // the TUI is actually ready to accept input.
-      if (!session.ivReady) {
-        debug('[IV] TUI not ready — stashing input for deferred send');
-        session.ivPendingInput = contentBlocks;
+      // Gate on TUI readiness via the phase controller:
+      //   loading → stash in FIFO (controller delivers on free transition)
+      //   modal   → hold in heldInput (not typed; modal handles it)
+      //   free    → type now (pass-through to iv.sendText below)
+      if (session._ivCtrl && session._ivCtrl.phase !== 'free') {
+        const action = session._ivCtrl.accept(contentBlocks);
+        debug(`[IV] Phase=${session._ivCtrl.phase} — ${action.action} input`);
         if (session.resetTimeout) session.resetTimeout();
         return true;
       }
@@ -4937,6 +5004,7 @@ function killSession(session, signal = 'SIGTERM') {
   if (!session) return;
   if (session._enterRetryTimer) { clearTimeout(session._enterRetryTimer); session._enterRetryTimer = null; }
   if (session._escBusyTimer) { clearTimeout(session._escBusyTimer); session._escBusyTimer = null; }
+  if (session._ivCtrl) { session._ivCtrl.dispose(); session._ivCtrl = null; }
   // Stop the subagent watcher up-front so its tails and burst timer don't
   // keep running if the child ignores SIGTERM. The close handler also
   // stops it, but belt-and-braces.

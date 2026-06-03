@@ -12,7 +12,7 @@
     "test": "vitest run",
     "bootstrap-crosssigning": "node bootstrap-crosssigning.mjs",
     "lint": "eslint . --max-warnings=0",
-    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check setup-user.mjs && node --check verify-bots.mjs && node --check bootstrap-crosssigning.mjs && node --check lib/transcribe.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js && node --check lib/mcp-config.js && node --check lib/pre-trust.js && node --check lib/pty-input.js && node --check lib/transcript-tail.js && node --check lib/prompt-detector.js && node --check lib/interactive-session.js && node --check lib/iv-uploads.js && node --check test/stub-claude.mjs",
+    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check setup-user.mjs && node --check verify-bots.mjs && node --check bootstrap-crosssigning.mjs && node --check lib/transcribe.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js && node --check lib/mcp-config.js && node --check lib/pre-trust.js && node --check lib/pty-input.js && node --check lib/transcript-tail.js && node --check lib/prompt-detector.js && node --check lib/interactive-session.js && node --check lib/iv-uploads.js && node --check lib/iv-readiness.js && node --check test/stub-claude.mjs",
     "audit:high": "npm audit --audit-level=high",
     "ci": "npm run lint && npm run check && npm test && npm run audit:high"
   },
