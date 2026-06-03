@@ -529,6 +529,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
+        // Carry an undelivered --prompt across the restart (iv-mode only; undefined
+        // and harmless in print mode). The replacement keeps pendingWelcome=true, so
+        // a crash before the operator joins still fires the prompt on their join.
+        restarted.pendingAutoPrompt = session.pendingAutoPrompt;
         // Carry user-visible state across the restart so the user doesn't
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
@@ -814,6 +818,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
+        // Carry an undelivered --prompt across the restart (iv-mode only; undefined
+        // and harmless in print mode). The replacement keeps pendingWelcome=true, so
+        // a crash before the operator joins still fires the prompt on their join.
+        restarted.pendingAutoPrompt = session.pendingAutoPrompt;
         // Carry user-visible state across the restart so the user doesn't
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
