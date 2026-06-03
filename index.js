@@ -712,11 +712,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // Construct the readiness controller for this session.
   const ctrl = IvReadinessController({
     deliver(blocks) {
-      // Convert content-blocks to text and type into the PTY (same as
-      // sendToSession's iv-mode path, but post-readiness, no re-stash).
+      // Convert content-blocks to text and submit via the shared helper so
+      // deferred/stashed flushes get the same Enter-retry watchdog as live
+      // sends (Blocker 1 fix: was session.iv.sendText() which bypassed retry).
       const text = blocksToText(blocks);
       if (text && session.iv && session.iv.alive) {
-        session.iv.sendText(text);
+        submitIvText(session, text);
       }
     },
     respond(response) {
@@ -840,7 +841,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // first-run modals, /login, unauthenticated "please run /login"
     // pseudo-turns) — without this the bridge's `busy` flag gets stuck
     // and every subsequent user message hits the queue path.
-    if (session.busy) {
+    //
+    // Blocker 2 fix: only clear busy when the prompt was NOT auto-resolved
+    // by a stashed item.  When resolved=true the code above set busy=true so
+    // that post-resolution follow-ups route through the durable queuedMessages
+    // path (onTurnEnd drains it).  Clearing busy here would immediately undo
+    // that protection, causing follow-ups to land in heldInput + watchdog
+    // where they can be silently dropped after 60 s.
+    if (!resolved && session.busy) {
       console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
       session.busy = false;
       if (session.typingInterval) {
@@ -2165,6 +2173,45 @@ function clearBusyAfterEsc(session) {
   }, 2000);
 }
 
+/**
+ * Submit text to an active iv-mode PTY and arm the Enter-retry watchdog.
+ *
+ * Shared by both the normal immediate-send path (sendToSession) and the
+ * controller's deliver() callback (deferred/stashed flush).  Using a single
+ * helper ensures that deferred flushes get the same retry-on-swallowed-Enter
+ * protection as live sends, and that session.busy / turn state are managed
+ * consistently in both paths.
+ *
+ * Caller is responsible for ensuring session.iv exists and is alive before
+ * calling, and for setting session.busy = true and starting the typing
+ * indicator before calling (sendToSession does this; deliver() relies on the
+ * busy=true that was set during the auto-resolve branch in iv.on('prompt')).
+ */
+function submitIvText(session, text) {
+  session.iv.sendText(text);
+  // Enter retry: after sending text, the 500ms delayed Enter may be
+  // swallowed if the TUI has a transient hiccup. Watch for transcript
+  // activity — if none arrives within 3s, retry Enter. Up to 2 retries.
+  let retries = 0;
+  const maxRetries = 2;
+  const retryMs = 3000;
+  function scheduleRetry() {
+    if (retries >= maxRetries) return;
+    session._enterRetryTimer = setTimeout(() => {
+      session._enterRetryTimer = null;
+      if (!session.alive || !session.iv?.alive) return;
+      if (!session.busy) return;
+      if (session.responseBuffer.trim()) return;
+      retries++;
+      debug(`[IV] Enter retry ${retries}/${maxRetries} — no response after ${retryMs}ms`);
+      session.iv.sendKeystroke('enter');
+      scheduleRetry();
+    }, retryMs);
+    if (typeof session._enterRetryTimer.unref === 'function') session._enterRetryTimer.unref();
+  }
+  scheduleRetry();
+}
+
 function sendToSession(session, contentBlocks) {
   if (!session.alive || session._autoStopped) return false;
 
@@ -2198,28 +2245,7 @@ function sendToSession(session, contentBlocks) {
         if (session.resetTimeout) session.resetTimeout();
         return true;
       }
-      session.iv.sendText(text);
-      // Enter retry: after sending text, the 500ms delayed Enter may be
-      // swallowed if the TUI has a transient hiccup. Watch for transcript
-      // activity — if none arrives within 3s, retry Enter. Up to 2 retries.
-      let retries = 0;
-      const maxRetries = 2;
-      const retryMs = 3000;
-      function scheduleRetry() {
-        if (retries >= maxRetries) return;
-        session._enterRetryTimer = setTimeout(() => {
-          session._enterRetryTimer = null;
-          if (!session.alive || !session.iv?.alive) return;
-          if (!session.busy) return;
-          if (session.responseBuffer.trim()) return;
-          retries++;
-          debug(`[IV] Enter retry ${retries}/${maxRetries} — no response after ${retryMs}ms`);
-          session.iv.sendKeystroke('enter');
-          scheduleRetry();
-        }, retryMs);
-        if (typeof session._enterRetryTimer.unref === 'function') session._enterRetryTimer.unref();
-      }
-      scheduleRetry();
+      submitIvText(session, text);
       if (session.resetTimeout) session.resetTimeout();
       return true;
     }

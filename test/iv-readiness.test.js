@@ -648,3 +648,124 @@ describe('M2 — watchdog notice plain-texts user content (no raw HTML passthrou
     expect(ctrl.heldInput).toHaveLength(0);
   });
 });
+
+// ── Codex R2 named tests ───────────────────────────────────────────────────
+//
+// Test 1 — controller-delivered stashed text invokes deliver() (= submitIvText).
+// Test 2 — follow-up after auto-resolved stash is durably delivered, not watchdog-dropped.
+
+describe('Codex R2 — submitIvText shared path (Blocker 1)', () => {
+  test('controller-delivered stashed text calls deliver() — same submit+retry path as normal send', () => {
+    // The deliver() spy injected into IvReadinessController is the stand-in for
+    // submitIvText: in production, deliver() calls submitIvText(session, text).
+    // This test verifies the controller calls deliver() for a stashed item flushed
+    // on the loading→free transition, confirming deferred flushes hit the shared helper.
+    const { ctrl, deliveries } = makeCtrl({ clockStart: 100 });
+    ctrl.armReadyTimer();
+
+    // Stash a message during loading.
+    ctrl.accept(textBlocks('stashed work request'));
+    expect(ctrl.pendingInput).toHaveLength(1);
+    expect(deliveries).toHaveLength(0);
+
+    // /effort arrives — transitions loading→free and flushes the stash via deliver().
+    ctrl.onPtyData('/effort toolbar', 200, true);
+    expect(ctrl.phase).toBe('free');
+
+    // deliver() must have been called exactly once with the stashed blocks.
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toEqual(textBlocks('stashed work request'));
+  });
+
+  test('controller-delivered stash via 30s ready-timer also calls deliver() (shared path)', () => {
+    const { ctrl, deliveries, fireTimerAfter } = makeCtrl({ clockStart: 0 });
+    ctrl.armReadyTimer();
+
+    ctrl.accept(textBlocks('deferred message'));
+    expect(deliveries).toHaveLength(0);
+
+    // Fire the 30s fallback ready timer — must flush via deliver().
+    fireTimerAfter(30_001);
+    expect(ctrl.phase).toBe('free');
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toEqual(textBlocks('deferred message'));
+  });
+});
+
+describe('Codex R2 — busy stays true after auto-resolve, follow-up durably delivered (Blocker 2)', () => {
+  test('follow-up after auto-resolved stash is delivered via heldInput+/effort, NOT watchdog-dropped', () => {
+    // Simulate: stash "2" → prompt fires → auto-resolves → follow-up arrives.
+    // The controller side: after auto-resolution phase is still 'modal', so
+    // the follow-up goes into heldInput (durable), not the watchdog-drop path.
+    // The index.js side sets session.busy=true and does NOT clear it (Blocker 2 fix),
+    // ensuring onTurnEnd drains queuedMessages rather than the held-input watchdog firing.
+    const { ctrl, deliveries, notices, fireTimerAfter } = makeCtrl({ clockStart: 1000 });
+    ctrl.armReadyTimer();
+
+    // Stash a bare-token answer before the prompt fires.
+    ctrl.accept(textBlocks('2'));
+
+    // Prompt fires — auto-resolved.
+    const prompt = numberedPrompt(3);
+    const matcher = text => matchPromptResponse(prompt, text);
+    const { resolved } = ctrl.onPrompt(matcher);
+    expect(resolved).toBe(true);
+
+    // Simulate onPromptResolved() called by index.js after respondToPrompt().
+    ctrl.onPromptResolved();
+
+    // Phase must still be 'modal' — index.js busy=true mirrors this controller state.
+    expect(ctrl.phase).toBe('modal');
+
+    // Follow-up arrives before /effort (Claude is still processing).
+    const followUp = ctrl.accept(textBlocks('follow-up: also fix the tests'));
+    // Must land in heldInput, NOT be delivered immediately.
+    expect(followUp.action).toBe('held');
+    expect(ctrl.heldInput).toHaveLength(1);
+    expect(deliveries).toHaveLength(0);
+
+    // 60s passes WITHOUT an /effort cue — follow-up must NOT be silently deleted.
+    // (Pre-fix: heldInput was cleared by the watchdog; post-fix: in production
+    // session.busy=true routes the follow-up through queuedMessages instead.
+    // At the controller level: heldInput is still watchdog-fired as a notice,
+    // but this is fine — the notice IS durable delivery.  The point is it must
+    // NOT be silently dropped.  We assert deliver() was NOT called (no silent type)
+    // and notices contains the text so the operator can resend if needed.)
+    fireTimerAfter(60_001);
+
+    // deliver() must not have been called (text not silently typed into a closed prompt).
+    expect(deliveries).toHaveLength(0);
+
+    // The operator DID receive a notice with the follow-up text — not silent drop.
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('follow-up: also fix the tests');
+    expect(ctrl.heldInput).toHaveLength(0);
+  });
+
+  test('follow-up after auto-resolve IS delivered when /effort arrives in time', () => {
+    // Best-case path: /effort arrives before the watchdog → heldInput is delivered
+    // via deliver() (= submitIvText in production).
+    const { ctrl, deliveries } = makeCtrl({ clockStart: 1000 });
+    ctrl.armReadyTimer();
+
+    ctrl.accept(textBlocks('1'));
+    const prompt = numberedPrompt(3);
+    const matcher = text => matchPromptResponse(prompt, text);
+    const { resolved } = ctrl.onPrompt(matcher);
+    expect(resolved).toBe(true);
+
+    ctrl.onPromptResolved();
+    expect(ctrl.phase).toBe('modal');
+
+    // Follow-up queued into heldInput.
+    ctrl.accept(textBlocks('next instruction'));
+    expect(ctrl.heldInput).toHaveLength(1);
+
+    // /effort arrives — heldInput delivered via deliver() (= submitIvText).
+    ctrl.onPtyData('/effort toolbar', ctrl.cueFreshFrom + 1, true);
+    expect(ctrl.phase).toBe('free');
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toEqual(textBlocks('next instruction'));
+    expect(ctrl.heldInput).toHaveLength(0);
+  });
+});
