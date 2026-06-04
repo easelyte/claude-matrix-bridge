@@ -1092,12 +1092,13 @@ function formatQuestion(q, index, total) {
   msg += q.question + '\n';
 
   if (q.options && q.options.length > 0) {
-    msg += '\n';
+    // Blank line before each option for separation; ⭐ marks a "(Recommended)" label.
     q.options.forEach((opt, i) => {
       const letter = String.fromCharCode(65 + i); // A, B, C...
-      const label = opt.label || opt;
+      const label = typeof opt.label === 'string' ? opt.label : typeof opt === 'string' ? opt : String(opt.label ?? opt);
       const desc = opt.description || '';
-      msg += `${letter}. ${typeof label === 'string' ? label : String(label)}\n`;
+      const marker = /\(recommended\)/i.test(label) ? '⭐ ' : '';
+      msg += `\n${marker}${letter}. ${label}\n`;
       if (desc) {
         msg += `   ${desc}\n`;
       }
@@ -1109,29 +1110,34 @@ function formatQuestion(q, index, total) {
 }
 
 function formatQuestionHtml(q, index, total) {
+  // Matrix custom HTML (org.matrix.custom.html) collapses raw "\n" to a single
+  // space, so options separated only by newlines render as a run-on wall in
+  // Element/matron-web. Use explicit <br> for line breaks and a blank line
+  // (double <br>) between options so A/B/C are visually separated. An option
+  // whose label is tagged "(Recommended)" gets a ⭐ marker.
   let msg = '';
   const prefix = total > 1 ? `❓ Question ${index + 1}/${total}` : '❓';
 
   if (q.header) {
-    msg += `${prefix} — <b>${escapeHtml(q.header)}</b>\n\n`;
+    msg += `${prefix} — <b>${escapeHtml(q.header)}</b><br><br>`;
   } else {
-    msg += `${prefix}\n\n`;
+    msg += `${prefix}<br><br>`;
   }
 
-  msg += escapeHtml(q.question) + '\n';
+  msg += escapeHtml(q.question);
 
   if (q.options && q.options.length > 0) {
-    msg += '\n';
     q.options.forEach((opt, i) => {
       const letter = String.fromCharCode(65 + i);
-      const label = opt.label || opt;
+      const label = typeof opt.label === 'string' ? opt.label : typeof opt === 'string' ? opt : String(opt.label ?? opt);
       const desc = opt.description || '';
-      msg += `<b>${letter}.</b> ${escapeHtml(typeof label === 'string' ? label : String(label))}\n`;
+      const marker = /\(recommended\)/i.test(label) ? '⭐ ' : '';
+      msg += `<br><br>${marker}<b>${letter}.</b> ${escapeHtml(label)}`;
       if (desc) {
-        msg += `   <i>${escapeHtml(desc)}</i>\n`;
+        msg += `<br><i>${escapeHtml(desc)}</i>`;
       }
     });
-    msg += `\nReply with a letter (A, B, C…) or number (1, 2, 3…), or type a custom answer.`;
+    msg += `<br><br>Reply with a letter (A, B, C…) or number (1, 2, 3…), or type a custom answer.`;
   }
 
   return msg;
