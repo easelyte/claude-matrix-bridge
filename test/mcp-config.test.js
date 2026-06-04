@@ -45,6 +45,18 @@ describe('extractMcpExtraFlags', () => {
       .toEqual({ extras: ['browser'], rest: ['--not-a-flag', '/dir'] });
   });
 
+  it('accepts em-dash / en-dash auto-corrected forms of --browser', () => {
+    // Matrix/mobile clients auto-correct a leading "--" into "—" (em-dash),
+    // so the user's "--browser" arrives as "—browser".
+    expect(extractMcpExtraFlags(['—browser']))
+      .toEqual({ extras: ['browser'], rest: [] });
+    expect(extractMcpExtraFlags(['–browser', '/dir']))
+      .toEqual({ extras: ['browser'], rest: ['/dir'] });
+    // A unicode-dash token that isn't a known flag is preserved unchanged.
+    expect(extractMcpExtraFlags(['—notaflag']))
+      .toEqual({ extras: [], rest: ['—notaflag'] });
+  });
+
   it('returns empty extras when none requested', () => {
     expect(extractMcpExtraFlags(['/dir'])).toEqual({ extras: [], rest: ['/dir'] });
     expect(extractMcpExtraFlags([])).toEqual({ extras: [], rest: [] });
