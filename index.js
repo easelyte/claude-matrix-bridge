@@ -1640,6 +1640,20 @@ function handleClaudeEvent(session, event) {
         const toolName = block.name;
         const input = block.input || {};
 
+        // Ordering fix (PR#3): the MCP ask_user question is registered by POST
+        // /ask but surfaced from here so it renders AFTER the explanation text
+        // Claude emitted before it (already flushed above, before this loop).
+        // Fire the pending surface now, in order. (Reverse ordering — the
+        // transcript beating POST /ask — is pathological for a direct HTTP
+        // call vs a debounced file tail; that rare case falls back to POST
+        // /ask's safety timer, which is still correctly ordered because the
+        // preceding text has by then already flushed.)
+        if (toolName === 'mcp__ask-user__ask_user'
+            && session._pendingQuestionSurface
+            && !session._pendingQuestionSurface.surfaced) {
+          session._pendingQuestionSurface.surface();
+        }
+
         if (toolName === 'ExitPlanMode' && !session.iv) {
           // Print-mode only: stash the tool_use_id so a "build" reply can
           // emit the matching tool_result later. iv-mode handles approval
@@ -4717,6 +4731,14 @@ const pendingSecrets = new Map();
 // Claude Code stdio MCP tool-call ceiling and the bridge's 1h idle reaper.
 const ASK_USER_TIMEOUT_MS = parseInt(process.env.ASK_USER_TIMEOUT_MS || '1800000', 10);
 
+// Ordering fix (PR#3): how long POST /ask waits for the transcript-tail to
+// deliver this question's ask_user tool_use block (the in-order trigger to
+// surface it, after the preceding explanation text has flushed) before
+// surfacing anyway. Normally the transcript event arrives in ~300-600ms (tail
+// idle debounce + parse); this is the safety net for a stalled tail. Kept well
+// above typical transcript latency so the ordered trigger almost always wins.
+const QUESTION_SURFACE_MAX_WAIT_MS = parseInt(process.env.QUESTION_SURFACE_MAX_WAIT_MS || '2000', 10);
+
 // Bridge-owned expiry for an MCP ask_user question. Fired by the timer set in
 // POST /ask when the answer window elapses with no reply. Clears the session's
 // waiting state, stops the typing indicator, and tells the user the question
@@ -4879,20 +4901,42 @@ const apiServer = createServer(async (req, res) => {
             }]
           };
 
-          if (activeSession.typingInterval) {
-            clearInterval(activeSession.typingInterval);
-            activeSession.typingInterval = null;
-          }
-
-          activeSession.waitingForAnswer = `mcp:${questionId}`;
-          activeSession.pendingQuestions = parsed.questions;
-          activeSession.currentQuestionIndex = 0;
-          activeSession.questionAnswers = [];
-          activeSession.responseBuffer = '';
-
-          if (activeSession.sendCallback) {
-            sendAllQuestions(activeSession);
-          }
+          // Ordering fix (PR#3): the MCP question reaches us via this fast,
+          // direct HTTP path, while the explanation Claude emitted just BEFORE
+          // the ask_user call arrives later through the slower transcript-tail.
+          // Surfacing now renders the question ahead of its own explanation —
+          // and because surfacing sets waitingForAnswer (which gates text
+          // flushing) the explanation is then held until the user answers, so
+          // it lands AFTER the answer. Instead, DEFER: the transcript handler
+          // fires surface() the instant it processes this question's ask_user
+          // tool_use block, which is right after the preceding text has flushed
+          // (handleClaudeEvent flushes text before the tool_use loop). The
+          // timeout is the safety net if that transcript event never arrives.
+          const surfaceState = { surfaced: false, timer: null };
+          const surface = () => {
+            if (surfaceState.surfaced) return;
+            surfaceState.surfaced = true;
+            if (surfaceState.timer) { clearTimeout(surfaceState.timer); surfaceState.timer = null; }
+            if (activeSession._pendingQuestionSurface === surfaceState) {
+              activeSession._pendingQuestionSurface = null;
+            }
+            if (activeSession.typingInterval) {
+              clearInterval(activeSession.typingInterval);
+              activeSession.typingInterval = null;
+            }
+            activeSession.waitingForAnswer = `mcp:${questionId}`;
+            activeSession.pendingQuestions = parsed.questions;
+            activeSession.currentQuestionIndex = 0;
+            activeSession.questionAnswers = [];
+            activeSession.responseBuffer = '';
+            if (activeSession.sendCallback) {
+              sendAllQuestions(activeSession);
+            }
+          };
+          surfaceState.surface = surface;
+          activeSession._pendingQuestionSurface = surfaceState;
+          surfaceState.timer = setTimeout(surface, QUESTION_SURFACE_MAX_WAIT_MS);
+          if (surfaceState.timer.unref) surfaceState.timer.unref();
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
