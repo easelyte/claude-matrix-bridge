@@ -767,6 +767,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // pseudo-turns) — without this the bridge's `busy` flag gets stuck
     // and every subsequent user message hits the queue path.
     if (session.busy) {
+      // [QUEUE-PROBE] working=true here = busy cleared while Claude is still
+      // generating → opens the window where the next message bypasses the queue.
+      const __q = probePtyState(session);
+      console.log(`[QUEUE-PROBE] BUSY-CLEAR via=iv-prompt kind=${prompt.kind} idleReady=${__q.idleReady} working=${__q.working} room=${session.roomId.slice(1, 7)}`);
       console.log(`[IV-DEBUG] Clearing busy=true on iv-prompt (kind=${prompt.kind})`);
       session.busy = false;
       if (session.typingInterval) {
@@ -1172,6 +1176,10 @@ function handleInteractiveScreenUpdate(session, update) {
   // PTY instead of dropping into the queue. Mirrors the iv-prompt
   // handler at iv.on('prompt') in createInteractiveSessionForRoom.
   if (session.busy) {
+    // [QUEUE-PROBE] working=true here = busy cleared mid-generation on a TUI
+    // cue → the window where the next operator message leaks into the PTY.
+    const __q = probePtyState(session);
+    console.log(`[QUEUE-PROBE] BUSY-CLEAR via=screen-update inputCue=${hasInputCue} idleReady=${__q.idleReady} working=${__q.working} room=${session.roomId.slice(1, 7)}`);
     console.log(`[IV-DEBUG] Clearing busy=true on screen-update (hasInputCue=${hasInputCue})`);
     session.busy = false;
   }
@@ -2101,6 +2109,31 @@ function flushResponse(session) {
   session.lastActivityAt = Date.now();
 }
 
+// [QUEUE-PROBE] Read-only instrumentation (separate from the compact fix).
+// Reports Claude's REAL TUI state at a given instant, independent of the
+// bridge's `busy` guess. We use it to detect two things:
+//   • BUSY-CLEAR while Claude is still generating → the bridge opened a window
+//     where the operator's next message bypasses the bridge queue.
+//   • SEND while Claude is still generating → that message was typed into the
+//     PTY mid-turn and lands in Claude Code's OWN internal queue (the
+//     "server-side queue" that replays as a surprise follow-up), not held
+//     bridge-side. `isIdleReadyScreen` keys off the TUI "esc to interrupt"
+//     hint, which is only present while a turn/compaction runs.
+// Remove once the leak is characterised.
+function probePtyState(session) {
+  try {
+    const buf = session.iv?.detector?.buf || '';
+    const compact = buf.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').toLowerCase().replace(/\s+/g, '');
+    return {
+      idleReady: isIdleReadyScreen(buf),
+      working: compact.includes('esctointerrupt'),
+      bufLen: buf.length,
+    };
+  } catch (e) {
+    return { idleReady: null, working: null, bufLen: 0, err: e?.message };
+  }
+}
+
 function clearBusyAfterEsc(session) {
   session.busy = false;
   if (session.typingInterval) {
@@ -2171,6 +2204,11 @@ function sendToSession(session, contentBlocks) {
         if (session.resetTimeout) session.resetTimeout();
         return true;
       }
+      // [QUEUE-PROBE] Snapshot Claude's real TUI state right before we type.
+      // idleReady=false + working=true here means we wrote mid-turn and the
+      // text landed in Claude Code's internal queue, not held bridge-side.
+      const __q = probePtyState(session);
+      console.log(`[QUEUE-PROBE] SEND room=${session.roomId.slice(1, 7)} idleReady=${__q.idleReady} working=${__q.working} busy=${session.busy} waiting=${!!session.waitingForAnswer} queued=${session.queuedMessages?.length || 0} bufLen=${__q.bufLen} text="${text.slice(0, 48).replace(/\n/g, ' ')}"`);
       // Propagate a dead-PTY write failure: iv.sendText returns false when the
       // PTY has exited (lib/interactive-session.js). Surfacing false lets callers
       // (incl. the auto-prompt path's delivery check) detect a lost write instead
