@@ -1651,7 +1651,7 @@ function handleClaudeEvent(session, event) {
         if (toolName === 'mcp__ask-user__ask_user'
             && session._pendingQuestionSurface
             && !session._pendingQuestionSurface.surfaced) {
-          session._pendingQuestionSurface.surface();
+          session._pendingQuestionSurface.surface('trigger');
         }
 
         if (toolName === 'ExitPlanMode' && !session.iv) {
@@ -4734,10 +4734,15 @@ const ASK_USER_TIMEOUT_MS = parseInt(process.env.ASK_USER_TIMEOUT_MS || '1800000
 // Ordering fix (PR#3): how long POST /ask waits for the transcript-tail to
 // deliver this question's ask_user tool_use block (the in-order trigger to
 // surface it, after the preceding explanation text has flushed) before
-// surfacing anyway. Normally the transcript event arrives in ~300-600ms (tail
-// idle debounce + parse); this is the safety net for a stalled tail. Kept well
-// above typical transcript latency so the ordered trigger almost always wins.
-const QUESTION_SURFACE_MAX_WAIT_MS = parseInt(process.env.QUESTION_SURFACE_MAX_WAIT_MS || '2000', 10);
+// surfacing anyway. The transcript path is the *correct* trigger; this timer
+// is only a last-resort so a genuinely stalled tail can't hang the question.
+// Set generously: under heavy parallel load the single event loop saturates
+// and transcript processing can lag several seconds, so a tight window (the
+// original 2s) lets the timer win the race and regress to question-before-
+// explanation. 30s gives the in-order trigger ample room while still bounding
+// a true stall. The [QUESTION-ORDER] log reports actual elapsed-to-surface so
+// this can be tuned from real data.
+const QUESTION_SURFACE_MAX_WAIT_MS = parseInt(process.env.QUESTION_SURFACE_MAX_WAIT_MS || '30000', 10);
 
 // Bridge-owned expiry for an MCP ask_user question. Fired by the timer set in
 // POST /ask when the answer window elapses with no reply. Clears the session's
@@ -4912,17 +4917,28 @@ const apiServer = createServer(async (req, res) => {
           // tool_use block, which is right after the preceding text has flushed
           // (handleClaudeEvent flushes text before the tool_use loop). The
           // timeout is the safety net if that transcript event never arrives.
+          const armedAt = Date.now();
           const surfaceState = { surfaced: false, timer: null };
-          const surface = () => {
+          const surface = (source) => {
             if (surfaceState.surfaced) return;
             surfaceState.surfaced = true;
             if (surfaceState.timer) { clearTimeout(surfaceState.timer); surfaceState.timer = null; }
             if (activeSession._pendingQuestionSurface === surfaceState) {
               activeSession._pendingQuestionSurface = null;
             }
+            // Diagnostic: which path surfaced the question and how long it took.
+            // via=trigger = correct (transcript caught up); via=timer = the tail
+            // lagged past the window and we surfaced anyway (risks ordering).
+            console.log(`[QUESTION-ORDER] surface via=${source} elapsed=${Date.now() - armedAt}ms room=${activeSession.roomId.slice(1, 7)} q=${questionId}`);
             if (activeSession.typingInterval) {
               clearInterval(activeSession.typingInterval);
               activeSession.typingInterval = null;
+            }
+            // Flush any explanation text that has streamed in ahead of the
+            // question so it renders FIRST even on the timer path (best effort:
+            // only helps if the tail has at least partially caught up).
+            if (activeSession.responseBuffer && activeSession.responseBuffer.trim() && !activeSession.waitingForAnswer) {
+              flushResponse(activeSession);
             }
             activeSession.waitingForAnswer = `mcp:${questionId}`;
             activeSession.pendingQuestions = parsed.questions;
@@ -4935,7 +4951,7 @@ const apiServer = createServer(async (req, res) => {
           };
           surfaceState.surface = surface;
           activeSession._pendingQuestionSurface = surfaceState;
-          surfaceState.timer = setTimeout(surface, QUESTION_SURFACE_MAX_WAIT_MS);
+          surfaceState.timer = setTimeout(() => surface('timer'), QUESTION_SURFACE_MAX_WAIT_MS);
           if (surfaceState.timer.unref) surfaceState.timer.unref();
         }
 
