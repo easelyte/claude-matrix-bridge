@@ -1969,6 +1969,38 @@ function handleClaudeEvent(session, event) {
         } else if (session.sendCallback) {
           session.sendCallback(taskPlain);
         }
+      } else if (event.subtype === 'compact_boundary') {
+        // A manual `/compact` finishes here: the transcript writes a
+        // compact_boundary marker but — unlike a normal turn — no Stop hook
+        // fires, so onTurnEnd (the authoritative iv turn-end signal) never
+        // runs and `busy` stays stuck true, wedging every later message into
+        // the queue. When we know the operator kicked off this compaction
+        // (flag set at /compact dispatch) and the boundary confirms a manual
+        // trigger, treat it as the turn-end: clear busy and flush the queue
+        // via onTurnEnd. Auto-compactions (trigger='auto') happen mid-turn
+        // and MUST NOT clear busy here — their real Stop hook fires when the
+        // interrupted turn completes.
+        const trigger = event.compactMetadata?.trigger;
+        if (session._operatorCompactPending && trigger === 'manual') {
+          session._operatorCompactPending = false;
+          if (session._operatorCompactTimer) {
+            clearTimeout(session._operatorCompactTimer);
+            session._operatorCompactTimer = null;
+          }
+          if (session.sendHtml) {
+            const n = notice('success', '✅ Done compacting — context summarized, ready for your next message.');
+            session.sendHtml(n.plain, n.html);
+          } else if (session.sendCallback) {
+            session.sendCallback('✅ Done compacting — context summarized, ready for your next message.');
+          }
+          // onTurnEnd clears busy + typing and flushes any queued messages.
+          // Print-mode sessions have no onTurnEnd (no PTY); clear busy directly.
+          if (session.iv && typeof session.onTurnEnd === 'function') {
+            session.onTurnEnd();
+          } else {
+            session.busy = false;
+          }
+        }
       }
       break;
     }
@@ -4431,6 +4463,26 @@ client.on('room.message', async (roomId, event) => {
   // still-running prior turn should still flush when that turn ends.
   if (!isClaudeSlashCommand) {
     session.queuedMessages = null;
+  }
+
+  // An operator-typed `/compact` compacts and returns to the idle input box
+  // WITHOUT producing an assistant turn — so no Stop hook fires and the iv
+  // turn-end path (onTurnEnd) never runs to clear `busy`. The session then
+  // wedges in busy=true and every later message drops into the queue. Mark
+  // it here so the matching compact_boundary transcript event can stand in
+  // as the turn-end signal (see case 'system' in handleClaudeEvent). The
+  // flag is operator-scoped on purpose: a model-invoked /compact mid-turn is
+  // also trigger='manual' but DOES continue into a real turn + Stop hook, so
+  // it must not be cleared here. Self-clears after a generous window in case
+  // compaction fails and no boundary event ever arrives.
+  if (isClaudeSlashCommand && /^\/compact(\s|$)/.test(text.trim())) {
+    session._operatorCompactPending = true;
+    if (session._operatorCompactTimer) clearTimeout(session._operatorCompactTimer);
+    session._operatorCompactTimer = setTimeout(() => {
+      session._operatorCompactTimer = null;
+      session._operatorCompactPending = false;
+    }, 300_000);
+    if (typeof session._operatorCompactTimer.unref === 'function') session._operatorCompactTimer.unref();
   }
 
   if (hasMedia) {
