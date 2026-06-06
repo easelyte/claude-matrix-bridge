@@ -1,5 +1,5 @@
 import { describe, it, test, expect } from 'vitest';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, isGeneratingScreen, PromptDetector } from '../lib/prompt-detector.js';
 
 describe('stripAnsi', () => {
   it('removes color codes', () => {
@@ -926,6 +926,39 @@ describe('isIdleReadyScreen', () => {
       'Enter to confirm · Esc to cancel',
     ].join('\n');
     expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+});
+
+describe('isGeneratingScreen', () => {
+  it('returns true while a turn is running (esc to interrupt in tail)', () => {
+    const screen = [
+      '✻ Baking… (12s)',
+      '────────────────────────────────────────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt',
+    ].join('\n');
+    expect(isGeneratingScreen(screen)).toBe(true);
+  });
+
+  it('returns false for an idle input screen (no interrupt hint)', () => {
+    const screen = [
+      '❯ ',
+      '────────────────────────────────────────',
+      '⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(isGeneratingScreen(screen)).toBe(false);
+  });
+
+  it('returns false for empty / blank screens (no false "busy" — lets idle sends through)', () => {
+    // Critical for the send-path gate: right after detector.reset() the buffer
+    // is empty; it must NOT read as generating, or legitimate idle sends would
+    // be deferred and delayed by the hold hard-cap.
+    expect(isGeneratingScreen('')).toBe(false);
+    expect(isGeneratingScreen('\x1b[2J\x1b[H')).toBe(false);
+  });
+
+  it('is robust to cursor-forward gaps that collapse spaces', () => {
+    expect(isGeneratingScreen('⏵⏵bypasspermissionson·esctointerrupt')).toBe(true);
+    expect(isGeneratingScreen('⏵⏵bypasspermissionson (shift+tabtocycle)')).toBe(false);
   });
 });
 

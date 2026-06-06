@@ -14,7 +14,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, isGeneratingScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, extractPromptFlag, knownMcpExtras } from './lib/mcp-config.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -2186,6 +2186,32 @@ function sendToSession(session, contentBlocks) {
     (session._resumeOutbox ||= []).push(contentBlocks);
     session.lastActivityAt = Date.now();
     return true;
+  }
+
+  // Idle-gate (fix #2): if the iv TUI is actively generating, typing now would
+  // leak the message into claude's OWN input queue (it surfaces as a surprise
+  // follow-up later, out of the bridge's control). `busy` is not a reliable
+  // "idle" signal here — autopilot / multi-turn flows clear it at each Stop hook
+  // while claude immediately keeps working, which is exactly when these leaks
+  // were observed. Defer via the same resume-hold machinery: arm the hold,
+  // buffer this message, and let startResumeReadyWatcher flush it (merged, in
+  // order) once the TUI returns to the idle input box (hard-capped so nothing
+  // is lost). Gate on a POSITIVE generating signal so the brief blank buffer
+  // right after detector.reset() doesn't false-defer legitimate idle sends.
+  // Slash commands keep their immediate path (control commands, not turns).
+  if (session.iv && session.ivReady && isGeneratingScreen(session.iv.detector?.buf || '')) {
+    const heldText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
+    const isSlash = heldText.startsWith('/') && !heldText.startsWith('//');
+    if (!isSlash) {
+      enterResumeHold(session);
+      session._resumeOutbox.push(contentBlocks);
+      session.busy = true;
+      if (session.typingInterval) clearInterval(session.typingInterval);
+      session.typingInterval = startTyping(session.roomId);
+      session.lastActivityAt = Date.now();
+      console.log(`[QUEUE-PROBE] DEFER room=${session.roomId.slice(1, 7)} (TUI generating) text="${heldText.slice(0, 48).replace(/\n/g, ' ')}"`);
+      return true;
+    }
   }
 
   session.lastActivityAt = Date.now();
