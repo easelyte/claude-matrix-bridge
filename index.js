@@ -1648,10 +1648,16 @@ function handleClaudeEvent(session, event) {
         // call vs a debounced file tail; that rare case falls back to POST
         // /ask's safety timer, which is still correctly ordered because the
         // preceding text has by then already flushed.)
-        if (toolName === 'mcp__ask-user__ask_user'
-            && session._pendingQuestionSurface
-            && !session._pendingQuestionSurface.surfaced) {
-          session._pendingQuestionSurface.surface('trigger');
+        if (toolName === 'mcp__ask-user__ask_user') {
+          if (session._pendingQuestionSurface && !session._pendingQuestionSurface.surfaced) {
+            session._pendingQuestionSurface.surface('trigger');
+          } else {
+            // Reverse ordering: POST /ask hasn't armed the surface yet. The
+            // preceding explanation has just flushed (text blocks are handled
+            // above, before this loop), so record the sighting — the imminent
+            // POST /ask will surface immediately instead of waiting the timer.
+            session._askUserSeenAt = Date.now();
+          }
         }
 
         if (toolName === 'ExitPlanMode' && !session.iv) {
@@ -4768,7 +4774,17 @@ const ASK_USER_TIMEOUT_MS = parseInt(process.env.ASK_USER_TIMEOUT_MS || '1800000
 // explanation. 30s gives the in-order trigger ample room while still bounding
 // a true stall. The [QUESTION-ORDER] log reports actual elapsed-to-surface so
 // this can be tuned from real data.
-const QUESTION_SURFACE_MAX_WAIT_MS = parseInt(process.env.QUESTION_SURFACE_MAX_WAIT_MS || '30000', 10);
+const QUESTION_SURFACE_MAX_WAIT_MS = parseInt(process.env.QUESTION_SURFACE_MAX_WAIT_MS || '15000', 10);
+
+// Reverse-ordering freshness window: when the transcript delivers an ask_user
+// tool_use BEFORE POST /ask arms the surface (common — observed on 2 of 3
+// questions in a brainstorm burst), the trigger records the sighting time and
+// the imminent POST surfaces immediately if it arrives within this window. The
+// preceding explanation has already flushed by then, so ordering stays correct
+// and the question doesn't wait out the safety timer. Bounded so a stale
+// sighting (POST that never arrives) can't make a much-later question skip its
+// own ordering wait.
+const ASK_USER_REVERSE_WINDOW_MS = 5000;
 
 // Bridge-owned expiry for an MCP ask_user question. Fired by the timer set in
 // POST /ask when the answer window elapses with no reply. Clears the session's
@@ -4952,6 +4968,7 @@ const apiServer = createServer(async (req, res) => {
             if (activeSession._pendingQuestionSurface === surfaceState) {
               activeSession._pendingQuestionSurface = null;
             }
+            activeSession._askUserSeenAt = 0;
             // Diagnostic: which path surfaced the question and how long it took.
             // via=trigger = correct (transcript caught up); via=timer = the tail
             // lagged past the window and we surfaced anyway (risks ordering).
@@ -4979,6 +4996,12 @@ const apiServer = createServer(async (req, res) => {
           activeSession._pendingQuestionSurface = surfaceState;
           surfaceState.timer = setTimeout(() => surface('timer'), QUESTION_SURFACE_MAX_WAIT_MS);
           if (surfaceState.timer.unref) surfaceState.timer.unref();
+          // Reverse ordering: the transcript already delivered this question's
+          // ask_user tool_use just before this POST (its explanation has thus
+          // already flushed). Surface now rather than waiting out the timer.
+          if (activeSession._askUserSeenAt && (Date.now() - activeSession._askUserSeenAt) < ASK_USER_REVERSE_WINDOW_MS) {
+            surface('reverse');
+          }
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
