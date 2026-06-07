@@ -45,12 +45,6 @@ const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || p
 // behaviour, or 0 to disable the reaper entirely).
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
-// Absolute backstop for the reaper's "still generating" skip: even a session
-// whose TUI shows "esc to interrupt" (so it looks busy) is reaped once it has
-// gone this long without a turn-end, so a genuinely hung session (frozen
-// interrupt hint, no real progress) can't linger forever. 6h leaves ample room
-// for legitimate long background workflows (deep-research) to finish.
-const SESSION_IDLE_HARD_CAP_MS = parseInt(process.env.SESSION_IDLE_HARD_CAP_MS || '21600000', 10);
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -1500,11 +1494,6 @@ function handleSubagentEvent(session, { label, event }) {
   if (!event || !event.message) return;
   const content = event.message.content;
   if (!Array.isArray(content)) return;
-
-  // Subagent activity (e.g. a deep-research / workflow fan-out) counts as the
-  // session being alive for the idle reaper, which otherwise only sees
-  // main-session turn-ends and would reap a long background workflow mid-run.
-  session.lastActivityAt = Date.now();
 
   if (event.type === 'assistant') {
     // Subagent transcripts on disk write each reasoning message as its
@@ -5417,21 +5406,7 @@ function startIdleReaper() {
       if (!session.alive) continue;
       if (session._autoStopped) continue;
       const last = session.lastActivityAt || session.startedAt || 0;
-      const idle = now - last;
-      if (idle < SESSION_IDLE_TIMEOUT_MS) continue;
-
-      // Protect actively-working sessions (fix B). A long background workflow
-      // (deep-research) or a turn blocked on a slow tool produces no
-      // main-session turn-end, so lastActivityAt goes stale even while claude is
-      // busy — the old reaper SIGTERM'd such sessions mid-run. If the TUI is
-      // still generating ("esc to interrupt"), skip the reap, up to an absolute
-      // hard cap so a genuinely hung session (frozen hint, no progress) is still
-      // eventually cleaned. (Subagent fan-out is also covered separately by
-      // handleSubagentEvent bumping lastActivityAt.)
-      if (idle < SESSION_IDLE_HARD_CAP_MS && session.iv && isGeneratingScreen(session.iv.detector?.buf || '')) {
-        debug(`Idle reaper: skipping ${roomId} — TUI still generating (idle ${Math.round(idle / 60000)}m)`);
-        continue;
-      }
+      if (now - last < SESSION_IDLE_TIMEOUT_MS) continue;
 
       // Silent reap — posting a Matrix notice would bump the room to the top
       // of the user's room list, defeating the purpose. The session is
