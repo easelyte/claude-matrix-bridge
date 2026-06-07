@@ -2194,32 +2194,13 @@ function sendToSession(session, contentBlocks) {
     return true;
   }
 
-  // Idle-gate (fix #2): if the iv TUI is actively generating, typing now would
-  // leak the message into claude's OWN input queue (it surfaces as a surprise
-  // follow-up later, out of the bridge's control). `busy` is not a reliable
-  // "idle" signal here — autopilot / multi-turn flows clear it at each Stop hook
-  // while claude immediately keeps working, which is exactly when these leaks
-  // were observed. Defer via the same resume-hold machinery: arm the hold,
-  // buffer this message, and let startResumeReadyWatcher flush it (merged, in
-  // order) once the TUI returns to the idle input box (hard-capped so nothing
-  // is lost). Gate on a POSITIVE generating signal so the brief blank buffer
-  // right after detector.reset() doesn't false-defer legitimate idle sends.
-  // Slash commands keep their immediate path (control commands, not turns).
-  if (session.iv && session.ivReady && isGeneratingScreen(session.iv.detector?.buf || '')) {
-    const heldText = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n');
-    const isSlash = heldText.startsWith('/') && !heldText.startsWith('//');
-    if (!isSlash) {
-      enterResumeHold(session);
-      session._resumeOutbox.push(contentBlocks);
-      session.busy = true;
-      if (session.typingInterval) clearInterval(session.typingInterval);
-      session.typingInterval = startTyping(session.roomId);
-      session.lastActivityAt = Date.now();
-      console.log(`[QUEUE-PROBE] DEFER room=${session.roomId.slice(1, 7)} (TUI generating) text="${heldText.slice(0, 48).replace(/\n/g, ' ')}"`);
-      return true;
-    }
-  }
-
+  // NOTE: the iv idle-gate ("fix #2") was REVERTED 2026-06-07 — it caused a
+  // re-defer hang loop: when claude stays in a turn (or hangs mid-tool, so the
+  // TUI shows "esc to interrupt" persistently), every hard-cap flush re-checks
+  // isGeneratingScreen, finds it still true, and re-arms the hold — looping every
+  // RESUME_READY_HARDCAP_MS forever, and !esc couldn't clear it. isGeneratingScreen
+  // is retained for a careful re-do (needs: no re-defer when flushing a hold, a
+  // bounded retry count, and !esc clearing the hold). See branch history.
   session.lastActivityAt = Date.now();
   session.responseBuffer = '';
   session.toolCalls = [];
