@@ -51,6 +51,25 @@ describe('TranscriptTail', () => {
     expect(events.map(e => e.n)).toEqual([1, 2]);
   });
 
+  it('emits a complete final line with no trailing newline yet, without double-emitting', async () => {
+    // Reproduces the ask_user-before-block case: claude writes a tool-call
+    // record then blocks for the answer, so the line's terminating newline
+    // isn't flushed until the next record (after the answer). The tail must
+    // emit the complete object immediately, and must not re-emit it when the
+    // newline + next record finally arrive.
+    const tail = new TranscriptTail(file);
+    const events = [];
+    tail.on('event', e => events.push(e));
+    await tail.start();
+    fs.writeFileSync(file, '{"type":"assistant","tool":"ask_user","n":1}');
+    await waitFor(() => events.length >= 1);
+    expect(events[0]).toMatchObject({ tool: 'ask_user', n: 1 });
+    fs.appendFileSync(file, '\n{"type":"user","n":2}\n');
+    await waitFor(() => events.length >= 2);
+    await tail.stop();
+    expect(events.map(e => e.n)).toEqual([1, 2]);
+  });
+
   it('emits parseError on a malformed line and keeps tailing', async () => {
     const tail = new TranscriptTail(file);
     const events = [];
