@@ -46,6 +46,13 @@ const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || p
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 
+// Model every bridge-spawned claude session runs on. The CLI defaults new
+// sessions to the standard 200k-context variant; pinning the `[1m]` variant
+// gives the full 1M context window (Opus 4.6 supports 1M). Without this, /ctx
+// readings and real headroom are capped at 200k. Override via env if needed
+// (e.g. a different model, or drop `[1m]` to go back to 200k).
+const BRIDGE_CLAUDE_MODEL = process.env.BRIDGE_CLAUDE_MODEL || 'claude-opus-4-6[1m]';
+
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
 // far longer than the 500ms paste→Enter window in sendText. Typing the first
@@ -351,6 +358,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const args = [
     '--print',
     '--verbose',
+    '--model', BRIDGE_CLAUDE_MODEL,
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     '--disallowed-tools', 'AskUserQuestion',
@@ -631,6 +639,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   }
   const worktreeName = options.worktree || persistedForRoom?.worktree || null;
   claudeArgs.push(
+    // Pin the 1M-context model variant — new sessions otherwise default to the
+    // 200k variant. Applies to resumes too (switches the session's model).
+    '--model', BRIDGE_CLAUDE_MODEL,
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
