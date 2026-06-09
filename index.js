@@ -48,10 +48,52 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 
 // Model every bridge-spawned claude session runs on. The CLI defaults new
 // sessions to the standard 200k-context variant; pinning the `[1m]` variant
-// gives the full 1M context window (Opus 4.6 supports 1M). Without this, /ctx
-// readings and real headroom are capped at 200k. Override via env if needed
-// (e.g. a different model, or drop `[1m]` to go back to 200k).
-const BRIDGE_CLAUDE_MODEL = process.env.BRIDGE_CLAUDE_MODEL || 'claude-opus-4-6[1m]';
+// gives the full 1M context window (Opus 4.6/4.7/4.8 and Sonnet 4.6 support
+// 1M). Without this, /ctx readings and real headroom are capped at 200k.
+// Set at runtime via `!model <name> [1m]` (persisted below); env seeds the
+// initial default.
+const DEFAULT_SPAWN_MODEL = process.env.BRIDGE_CLAUDE_MODEL || 'claude-opus-4-6[1m]';
+const SPAWN_MODEL_FILE = path.join(os.homedir(), '.claude-matrix-config.json');
+// Allowlist so a typo in `!model` can't silently break every future spawn.
+// Maps friendly input → full model id; ONE_M_CAPABLE gates the `[1m]` suffix.
+// For a model not listed, use the BRIDGE_CLAUDE_MODEL env var.
+const MODEL_ALIASES = {
+  opus: 'claude-opus-4-8', 'opus-4-8': 'claude-opus-4-8', 'opus-4-7': 'claude-opus-4-7', 'opus-4-6': 'claude-opus-4-6',
+  sonnet: 'claude-sonnet-4-6', 'sonnet-4-6': 'claude-sonnet-4-6',
+  haiku: 'claude-haiku-4-5', 'haiku-4-5': 'claude-haiku-4-5',
+};
+const ONE_M_CAPABLE = new Set(['claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6']);
+
+// Resolve `!model` args (alias or full id, optional `1m` / `[1m]` suffix) to a
+// validated model string, or { error }.
+function resolveSpawnModelInput(args) {
+  if (!args.length) return { error: 'usage: !model <name> [1m]   e.g. !model opus-4-6 1m' };
+  let token = args[0].toLowerCase();
+  let want1m = false;
+  if (token.endsWith('[1m]')) { want1m = true; token = token.slice(0, -4); }
+  if (args[1] && /^\[?1m\]?$/i.test(args[1])) want1m = true;
+  const known = new Set(Object.values(MODEL_ALIASES));
+  const base = MODEL_ALIASES[token] || (known.has(token) ? token : null);
+  if (!base) return { error: `unknown model "${args[0]}". options: ${[...new Set(Object.keys(MODEL_ALIASES))].join(', ')}` };
+  if (want1m && !ONE_M_CAPABLE.has(base)) return { error: `${base} has no 1M variant — drop "1m"` };
+  return { model: base + (want1m ? '[1m]' : '') };
+}
+
+function loadSpawnModel() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(SPAWN_MODEL_FILE, 'utf-8'));
+    if (cfg && typeof cfg.spawnModel === 'string' && cfg.spawnModel) return cfg.spawnModel;
+  } catch { /* no file / bad json — fall back to default */ }
+  return null;
+}
+function saveSpawnModel(model) {
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(SPAWN_MODEL_FILE, 'utf-8')) || {}; } catch { /* fresh file */ }
+  cfg.spawnModel = model;
+  fs.writeFileSync(SPAWN_MODEL_FILE, JSON.stringify(cfg, null, 2));
+}
+// Live spawn model — read at every spawn; mutated by `!model`, seeded from disk.
+let spawnModel = loadSpawnModel() || DEFAULT_SPAWN_MODEL;
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -358,7 +400,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const args = [
     '--print',
     '--verbose',
-    '--model', BRIDGE_CLAUDE_MODEL,
+    '--model', spawnModel,
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     '--disallowed-tools', 'AskUserQuestion',
@@ -641,7 +683,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   claudeArgs.push(
     // Pin the 1M-context model variant — new sessions otherwise default to the
     // 200k variant. Applies to resumes too (switches the session's model).
-    '--model', BRIDGE_CLAUDE_MODEL,
+    '--model', spawnModel,
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
@@ -3986,14 +4028,25 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!model': {
       const session = sessions.get(roomId);
-      if (session?.initData) {
-        const model = session.initData.model || '(unknown)';
-        const version = session.initData.claude_code_version || '(unknown)';
-        const fast = session.initData.fast_mode_state || 'off';
-        await sendReply(`Model: ${model}\nClaude Code: v${version}\nFast mode: ${fast}`);
-      } else {
-        await sendReply('No active session. Start a session to see model info.');
+      // With an argument: set the spawn-default model for FUTURE sessions.
+      if (parts.length > 1) {
+        const { model, error } = resolveSpawnModelInput(parts.slice(1));
+        if (error) { await sendReply(`⚠️ ${error}`); break; }
+        spawnModel = model;
+        try { saveSpawnModel(model); } catch (e) { debug('saveSpawnModel failed: %s', e?.message); }
+        await sendReply(`✅ Spawn model set to ${model} (persisted across restarts). Applies to new sessions, and to existing ones on their next restart/resume — not the current live turn.`);
+        break;
       }
+      // No argument: show the spawn default + this room's live model + version.
+      const opts = [...new Set(Object.keys(MODEL_ALIASES))].join(', ');
+      let msg = `🔧 Spawn model (new sessions): ${spawnModel}`;
+      if (session?.initData) {
+        msg += `\nThis room's live model: ${session.initData.model || '(unknown)'}` +
+               `  ·  Claude Code v${session.initData.claude_code_version || '?'}` +
+               `  ·  Fast: ${session.initData.fast_mode_state || 'off'}`;
+      }
+      msg += `\nSet default with: !model <name> [1m]\nOptions: ${opts}   (append 1m for the 1M window on opus/sonnet)`;
+      await sendReply(msg);
       break;
     }
 
