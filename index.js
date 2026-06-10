@@ -3658,21 +3658,21 @@ client.on('room.message', async (roomId, event) => {
     const qid = session.waitingForAnswer.slice(4);
     if (isMcpQuestionAbandoned(pendingMcpQuestions.get(qid), Date.now())) {
       if (pendingMcpQuestions.has(qid)) {
-        expireMcpQuestion(qid); // posts the "moved on" notice and clears the gate
+        // expireMcpQuestion clears the gate, posts the "moved on" notice, and —
+        // because the poller is abandoned here — clears the defunct turn's busy
+        // + typing too, so this message reaches Claude instead of queuing.
+        expireMcpQuestion(qid);
       } else {
-        // Defensive: gate armed but the question is already gone — just release.
+        // Defensive: gate armed but the question is already gone — release it
+        // and clear the defunct turn's busy/typing directly.
         session.waitingForAnswer = null;
         session.pendingQuestions = null;
-      }
-      // The ask_user turn is defunct (its poller is gone), so it will emit no
-      // more output and no Stop hook will clear `busy`. Clear it here so this
-      // message is delivered to Claude now instead of being queued behind the
-      // dead turn (which could otherwise stall until the poller's own deadline).
-      session.busy = false;
-      if (session.typingInterval) {
-        clearInterval(session.typingInterval);
-        session.typingInterval = null;
-        client.setTyping(session.roomId, false, 1000).catch(() => {});
+        session.busy = false;
+        if (session.typingInterval) {
+          clearInterval(session.typingInterval);
+          session.typingInterval = null;
+          client.setTyping(session.roomId, false, 1000).catch(() => {});
+        }
       }
     }
   }
@@ -4092,6 +4092,15 @@ function expireMcpQuestion(questionId) {
     session.pendingQuestions = null;
     session.currentQuestionIndex = 0;
     session.questionAnswers = [];
+    // If the poller is gone (early death, or it stopped before this timer
+    // fired), the turn is defunct and no Stop hook will clear `busy` — clear it
+    // so the user's next message reaches Claude instead of queuing behind a dead
+    // turn. When the poller is still alive (normal on-time timeout), leave
+    // `busy` set: the turn unwinds naturally once the poller observes `expired`,
+    // and clearing it here would race that legitimate continuation.
+    if (isMcpQuestionAbandoned(q, Date.now())) {
+      session.busy = false;
+    }
     if (session.typingInterval) {
       clearInterval(session.typingInterval);
       session.typingInterval = null;
