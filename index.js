@@ -51,8 +51,10 @@ const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300
 // gives the full 1M context window (Opus 4.6/4.7/4.8 and Sonnet 4.6 support
 // 1M). Without this, /ctx readings and real headroom are capped at 200k.
 // Set at runtime via `!model <name> [1m]` (persisted below); env seeds the
-// initial default.
-const DEFAULT_SPAWN_MODEL = process.env.BRIDGE_CLAUDE_MODEL || 'claude-opus-4-6[1m]';
+// initial default. Null by default: the bridge passes no --model and inherits
+// Claude Code's own default from ~/.claude/settings.json (currently a 1M-window
+// model). Set BRIDGE_CLAUDE_MODEL or persist via !model to override per-bridge.
+const DEFAULT_SPAWN_MODEL = process.env.BRIDGE_CLAUDE_MODEL || null;
 const SPAWN_MODEL_FILE = path.join(os.homedir(), '.claude-matrix-config.json');
 // Allowlist so a typo in `!model` can't silently break every future spawn.
 // Maps friendly input → full model id; ONE_M_CAPABLE gates the `[1m]` suffix.
@@ -400,7 +402,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const args = [
     '--print',
     '--verbose',
-    '--model', spawnModel,
+    // Only pin a model when configured (BRIDGE_CLAUDE_MODEL / persisted !model);
+    // otherwise inherit Claude Code's own default.
+    ...(spawnModel ? ['--model', spawnModel] : []),
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     '--disallowed-tools', 'AskUserQuestion',
@@ -681,9 +685,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   }
   const worktreeName = options.worktree || persistedForRoom?.worktree || null;
   claudeArgs.push(
-    // Pin the 1M-context model variant — new sessions otherwise default to the
-    // 200k variant. Applies to resumes too (switches the session's model).
-    '--model', spawnModel,
+    // Only pin a model when configured (BRIDGE_CLAUDE_MODEL / persisted !model);
+    // otherwise inherit Claude Code's own default. A pin applies to resumes too.
+    ...(spawnModel ? ['--model', spawnModel] : []),
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
