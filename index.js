@@ -16,6 +16,8 @@ import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { isMcpQuestionAbandoned } from './lib/mcp-question-gate.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -379,6 +381,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     firstMessageCaptured: false,
     // Captured from system init event
     initData: null,
+    currentModel: null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -602,6 +605,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     originRoomId: null,
     firstMessageCaptured: false,
     initData: null,
+    currentModel: null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -1377,6 +1381,12 @@ function handleSubagentEvent(session, { label, event }) {
 }
 
 function handleClaudeEvent(session, event) {
+  // Capture the current model from any event that carries message.model.
+  // This is the reliable source in iv-mode, where the system/init event (and
+  // thus session.initData.model) never arrives.
+  const capturedModel = modelFromEvent(event);
+  if (capturedModel) session.currentModel = capturedModel;
+
   // Capture session ID from any event that carries it.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
@@ -3386,13 +3396,36 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!model': {
       const session = sessions.get(roomId);
-      if (session?.initData) {
-        const model = session.initData.model || '(unknown)';
-        const version = session.initData.claude_code_version || '(unknown)';
-        const fast = session.initData.fast_mode_state || 'off';
-        await sendReply(`Model: ${model}\nClaude Code: v${version}\nFast mode: ${fast}`);
-      } else {
+      if (!session || !session.alive) {
         await sendReply('No active session. Start a session to see model info.');
+        break;
+      }
+      const arg = parts[1];
+      if (arg) {
+        switchModelInSession(session, arg, sendReply);
+        break;
+      }
+      const current = session.currentModel || session.initData?.model || null;
+      const extra = session.initData
+        ? `\nClaude Code: v${session.initData.claude_code_version || '(unknown)'}\nFast mode: ${session.initData.fast_mode_state || 'off'}`
+        : '';
+      const currentLine = current ? `Current model: ${current}` : 'Current model: (appears after the first reply)';
+      if (session.iv) {
+        // A live TUI means switching works. Prefer buttons, but fall back to a
+        // typed-command hint when no button channel is wired (e.g. some
+        // auto-started sessions) — never claim "needs interactive mode" here.
+        if (session.sendButtonMessage) {
+          const buttons = modelButtons();
+          const plain = `${currentLine}${extra}\n\nTap a model to switch, or type /model <name>.`;
+          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+          const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
+            `<br/><br/>Tap a model to switch, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
+          session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
+        } else {
+          await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
+        }
+      } else {
+        await sendReply(`${currentLine}${extra}\n\nSwitching models needs interactive mode.`);
       }
       break;
     }
@@ -3597,6 +3630,12 @@ client.on('room.message', async (roomId, event) => {
       const newSession = createSession(roomId, workdir);
       newSession.sendCallback = sendReply;
       newSession.sendHtml = sendHtmlFn;
+      // Wire the button channel like every other session-creation path (the
+      // auto-resume branch above, /start, /resume) so button-based features
+      // (/model picker, AskUserQuestion, queue actions) work in auto-started
+      // sessions instead of silently degrading to text-only.
+      newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
       session = newSession;
 
       const autoNotice = notice('info',
@@ -3661,6 +3700,13 @@ client.on('room.message', async (roomId, event) => {
             : `✕ Cancelled queued message (${remaining} remaining)`);
         }
       }
+      return;
+    }
+
+    // Model picker button (no-arg /model) — value is `model:<alias>`.
+    const modelMatch = value.match(/^model:(.+)$/);
+    if (modelMatch) {
+      switchModelInSession(session, modelMatch[1], sendReply);
       return;
     }
 
