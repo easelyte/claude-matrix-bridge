@@ -16,6 +16,8 @@ import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, knownMcpExtras } from './lib/mcp-config.js';
+import { modelFromEvent } from './lib/model-aliases.js';
+import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
@@ -378,6 +380,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     firstMessageCaptured: false,
     // Captured from system init event
     initData: null,
+    currentModel: null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -601,6 +604,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     originRoomId: null,
     firstMessageCaptured: false,
     initData: null,
+    currentModel: null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -1365,6 +1369,12 @@ function handleSubagentEvent(session, { label, event }) {
 }
 
 function handleClaudeEvent(session, event) {
+  // Capture the current model from any event that carries message.model.
+  // This is the reliable source in iv-mode, where the system/init event (and
+  // thus session.initData.model) never arrives.
+  const capturedModel = modelFromEvent(event);
+  if (capturedModel) session.currentModel = capturedModel;
+
   // Capture session ID from any event that carries it.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
