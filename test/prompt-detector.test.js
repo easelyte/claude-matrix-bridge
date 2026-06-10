@@ -129,6 +129,57 @@ describe('classifyScreen — arrow-menu', () => {
     const r = classifyScreen(screen);
     expect(r.kind).toBe('arrow-menu');
   });
+
+  it('does NOT misread a folded-paste input box as an arrow-menu', () => {
+    // Claude Code folds a large pasted message into a placeholder widget.
+    // The ❯ marker + "[Pasted text #N +M lines]" must not be read as a menu,
+    // else any multi-line paste surfaces a phantom prompt + clears busy.
+    const screen = [
+      'Look at this in MC:',
+      '❯ [Pasted text #1 +9 lines]',
+      '  paste again to expand',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('still detects a real menu whose first option mentions "paste" elsewhere', () => {
+    // Guard must be specific to the fold widget, not the word "paste".
+    const screen = [
+      'How should I proceed?',
+      '❯ Paste the snippet into the file',
+      '  Skip it',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r.kind).toBe('arrow-menu');
+    expect(r.options).toHaveLength(2);
+  });
+
+  it('still detects a real menu when a folded paste precedes it in the buffer', () => {
+    // The fold-widget marker must not block detection of a later real menu —
+    // the search skips paste-fold markers rather than rejecting at the first ❯.
+    const screen = [
+      '❯ [Pasted text #1 +9 lines]',
+      '  paste again to expand',
+      '',
+      'How should I proceed?',
+      '❯ Apply the change',
+      '  Cancel',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r.kind).toBe('arrow-menu');
+    expect(r.options.map(o => o.label)).toEqual(['Apply the change', 'Cancel']);
+    // The fold widget + hint must not leak into the surfaced question.
+    expect(r.question).toBe('How should I proceed?');
+    expect(r.question).not.toMatch(/Pasted text|paste again/i);
+  });
+
+  it('treats the widget + hint on a single line as a folded paste', () => {
+    const screen = [
+      'Look at this:',
+      '❯ [Pasted text #2 +14 lines] paste again to expand',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
 });
 
 describe('classifyScreen — numbered list inside prose', () => {
