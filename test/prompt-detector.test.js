@@ -305,6 +305,30 @@ describe('classifyScreen — arrow-menu', () => {
     const r = classifyScreen(screen);
     expect(r.kind).toBe('arrow-menu');
   });
+
+  it('does NOT misread a folded-paste input box as an arrow-menu', () => {
+    // Claude Code folds a large pasted message into a placeholder widget.
+    // The ❯ marker + "[Pasted text #N +M lines]" must not be read as a menu,
+    // else any multi-line paste surfaces a phantom prompt + clears busy.
+    const screen = [
+      'Look at this in MC:',
+      '❯ [Pasted text #1 +9 lines]',
+      '  paste again to expand',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('still detects a real menu whose first option mentions "paste" elsewhere', () => {
+    // Guard must be specific to the fold widget, not the word "paste".
+    const screen = [
+      'How should I proceed?',
+      '❯ Paste the snippet into the file',
+      '  Skip it',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r.kind).toBe('arrow-menu');
+    expect(r.options).toHaveLength(2);
+  });
 });
 
 describe('classifyScreen — numbered list inside prose', () => {
