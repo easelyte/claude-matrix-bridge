@@ -3343,18 +3343,30 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         const htmlMcp = `<b>MCP Servers</b><table>${htmlRows}</table>`;
         await sendHtml(`MCP Servers (live):\n\n${plainList}`, htmlMcp);
       } else {
+        // No initData.mcp_servers. In iv-mode there is no system/init event, so
+        // live server status is never exposed — fall back to the bridge's
+        // configured servers, but don't claim "no active session" when one is
+        // actually running. The live set may also include servers from the
+        // user's own Claude config that the bridge can't enumerate here.
+        const live = !!session?.alive;
         try {
           const configPath = path.join(__dirname, 'mcp-config.json');
           const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
           const names = Object.keys(config.mcpServers || {});
           if (names.length === 0) {
-            await sendReply('No MCP servers configured.');
+            await sendReply(live
+              ? "Live MCP status isn't available in interactive mode, and the bridge configures no servers."
+              : 'No MCP servers configured.');
           } else {
             const list = names.map(n => `⚪ ${n} — configured`).join('\n');
-            await sendReply(`MCP Servers (from config, no active session):\n\n${list}\n\nStart a session to see live status.`);
+            await sendReply(live
+              ? `Live MCP status isn't available in interactive mode.\nBridge-configured servers:\n\n${list}\n\n(Other servers from your Claude config may also be connected.)`
+              : `MCP Servers (from config, no active session):\n\n${list}\n\nStart a session to see live status.`);
           }
         } catch {
-          await sendReply('No MCP config found and no active session.');
+          await sendReply(live
+            ? "Live MCP status isn't available in interactive mode."
+            : 'No MCP config found and no active session.');
         }
       }
       break;
@@ -3422,8 +3434,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!tools': {
       const session = sessions.get(roomId);
-      if (!session?.initData?.tools) {
-        await sendReply('No session data available. Start a session first.');
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      if (!session.initData?.tools) {
+        // iv-mode has no system/init event, so the authoritative tool list is
+        // never exposed to the bridge. Be honest rather than implying there's
+        // no session (the on-disk transcript only carries partial tool deltas).
+        await sendReply("The tool list isn't available in interactive mode.");
         break;
       }
       const tools = session.initData.tools;
