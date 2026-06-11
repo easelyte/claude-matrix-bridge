@@ -60,6 +60,7 @@ const SPAWN_MODEL_FILE = path.join(os.homedir(), '.claude-matrix-config.json');
 // Maps friendly input → full model id; ONE_M_CAPABLE gates the `[1m]` suffix.
 // For a model not listed, use the BRIDGE_CLAUDE_MODEL env var.
 const MODEL_ALIASES = {
+  fable: 'claude-fable-5', 'fable-5': 'claude-fable-5',
   opus: 'claude-opus-4-8', 'opus-4-8': 'claude-opus-4-8', 'opus-4-7': 'claude-opus-4-7', 'opus-4-6': 'claude-opus-4-6',
   sonnet: 'claude-sonnet-4-6', 'sonnet-4-6': 'claude-sonnet-4-6',
   haiku: 'claude-haiku-4-5', 'haiku-4-5': 'claude-haiku-4-5',
